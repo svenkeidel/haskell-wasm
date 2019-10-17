@@ -19,9 +19,6 @@ library:
   - -Wwarn
   - -fwarn-incomplete-patterns
   - -fwarn-unused-imports
-  exposed-modules:
-  - Language.Wasm.Lexer
-  - Language.Wasm
   dependencies:
   - array                >= 0.5
   - text                 >= 1.1
