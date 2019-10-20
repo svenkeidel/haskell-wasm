@@ -17,6 +17,7 @@ module Language.Wasm.Interpreter (
     getGlobalValueByName,
     emptyStore,
     emptyImports,
+    emptyModInstance,
     makeHostModule,
     makeMutGlobal
 ) where
