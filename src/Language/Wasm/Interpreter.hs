@@ -1,6 +1,7 @@
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE TypeApplications #-}
 
 module Language.Wasm.Interpreter (
     Value(..),
@@ -28,9 +29,10 @@ import qualified Data.ByteString.Lazy as LBS
 import Data.Maybe (fromMaybe, isNothing)
 
 import Data.Vector (Vector, (!), (!?), (//))
-import Data.Vector.Storable.Mutable (IOVector)
 import qualified Data.Vector as Vector
-import qualified Data.Vector.Storable.Mutable as IOVector
+import qualified Data.Primitive.ByteArray as ByteArray
+import qualified Data.Primitive.Types as Primitive
+import qualified Control.Monad.Primitive as Primitive
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Word (Word8, Word16, Word32, Word64)
 import Data.Int (Int32, Int64)
@@ -165,9 +167,11 @@ data TableInstance = TableInstance {
     elements :: Vector (Maybe Address)
 }
 
+type MemoryStore = ByteArray.MutableByteArray (Primitive.PrimState IO)
+
 data MemoryInstance = MemoryInstance {
     lim :: Limit,
-    memory :: IORef (IOVector Word8)
+    memory :: IORef MemoryStore
 }
 
 data GlobalInstance = GIConst ValueType Value | GIMut ValueType (IORef Value)
@@ -234,17 +238,11 @@ makeHostModule st items = do
     where
         (|>) = flip ($)
 
-        isHostFunction :: (TL.Text, HostItem) -> Bool
-        isHostFunction (_, (HostFunction _ _)) = True
-        isHostFunction _ = False
-
         makeHostFunctions :: (Store, ModuleInstance) -> (Store, ModuleInstance)
         makeHostFunctions (st, inst) =
             let funcLen = Vector.length $ funcInstances st in
-            let hostFunctions = filter isHostFunction items in
-            let instances = map (\(_, (HostFunction t c)) -> HostInstance t c) hostFunctions in
-            let types = map (\(_, (HostFunction t _)) -> t) hostFunctions in
-            let exps = Vector.fromList $ zipWith (\(name, _) i -> ExportInstance name (ExternFunction i)) hostFunctions [funcLen..] in
+            let (names, types, instances) = unzip3 [(name, t, HostInstance t c) | (name, (HostFunction t c)) <- items] in
+            let exps = Vector.fromList $ zipWith (\name i -> ExportInstance name (ExternFunction i)) names [funcLen..] in
             let inst' = inst {
                     funcTypes = Vector.fromList types,
                     funcaddrs = Vector.fromList [funcLen..funcLen + length instances - 1],
@@ -253,17 +251,12 @@ makeHostModule st items = do
             in
             let st' = st { funcInstances = funcInstances st <> Vector.fromList instances } in
             (st', inst')
-
-        isHostGlobal :: (TL.Text, HostItem) -> Bool
-        isHostGlobal (_, (HostGlobal _)) = True
-        isHostGlobal _ = False
         
         makeHostGlobals :: (Store, ModuleInstance) -> (Store, ModuleInstance)
         makeHostGlobals (st, inst) =
             let globLen = Vector.length $ globalInstances st in
-            let hostGlobals = filter isHostGlobal items in
-            let instances = map (\(_, (HostGlobal g)) -> g) hostGlobals in
-            let exps = Vector.fromList $ zipWith (\(name, _) i -> ExportInstance name (ExternGlobal i)) hostGlobals [globLen..] in
+            let (names, instances) = unzip [(name, g) | (name, (HostGlobal g)) <- items] in
+            let exps = Vector.fromList $ zipWith (\name i -> ExportInstance name (ExternGlobal i)) names [globLen..] in
             let inst' = inst {
                     globaladdrs = Vector.fromList [globLen..globLen + length instances - 1],
                     exports = Language.Wasm.Interpreter.exports inst <> exps
@@ -271,34 +264,26 @@ makeHostModule st items = do
             in
             let st' = st { globalInstances = globalInstances st <> Vector.fromList instances } in
             (st', inst')
-
-        isHostMem :: (TL.Text, HostItem) -> Bool
-        isHostMem (_, (HostMemory _)) = True
-        isHostMem _ = False
             
         makeHostMems :: (Store, ModuleInstance) -> IO (Store, ModuleInstance)
         makeHostMems (st, inst) = do
             let memLen = Vector.length $ memInstances st
-            let hostMems = filter isHostMem items
-            instances <- allocMems $ map (\(_, (HostMemory lim)) -> Memory lim) hostMems
-            let exps = Vector.fromList $ zipWith (\(name, _) i -> ExportInstance name (ExternMemory i)) hostMems [memLen..]
+            let (names, limits) = unzip [(name, Memory lim) | (name, (HostMemory lim)) <- items]
+            instances <- allocMems limits
+            let exps = Vector.fromList $ zipWith (\name i -> ExportInstance name (ExternMemory i)) names [memLen..]
             let inst' = inst {
                     memaddrs = Vector.fromList [memLen..memLen + length instances - 1],
                     exports = Language.Wasm.Interpreter.exports inst <> exps
                 }
             let st' = st { memInstances = memInstances st <> instances }
             return (st', inst')
-
-        isHostTable :: (TL.Text, HostItem) -> Bool
-        isHostTable (_, (HostTable _)) = True
-        isHostTable _ = False
             
         makeHostTables :: (Store, ModuleInstance) -> IO (Store, ModuleInstance)
         makeHostTables (st, inst) = do
             let tableLen = Vector.length $ tableInstances st
-            let hostTables = filter isHostTable items
-            let instances = allocTables $ map (\(_, (HostTable lim)) -> Table (TableType lim AnyFunc)) hostTables
-            let exps = Vector.fromList $ zipWith (\(name, _) i -> ExportInstance name (ExternTable i)) hostTables [tableLen..]
+            let (names, tables) = unzip [(name, Table (TableType lim AnyFunc)) | (name, (HostTable lim)) <- items]
+            let instances = allocTables tables
+            let exps = Vector.fromList $ zipWith (\name i -> ExportInstance name (ExternTable i)) names [tableLen..]
             let inst' = inst {
                     tableaddrs = Vector.fromList [tableLen..tableLen + length instances - 1],
                     exports = Language.Wasm.Interpreter.exports inst <> exps
@@ -474,7 +459,9 @@ allocMems mems = Vector.fromList <$> mapM allocMem mems
     where
         allocMem :: Memory -> IO MemoryInstance
         allocMem (Memory lim@(Limit from to)) = do
-            mem <- IOVector.replicate (fromIntegral from * pageSize) 0
+            let size = fromIntegral from * pageSize
+            mem <- ByteArray.newByteArray size
+            ByteArray.setByteArray @Word64 mem 0 (size `div` 8) 0
             memory <- newIORef mem
             return MemoryInstance {
                 lim,
@@ -516,7 +503,7 @@ initialize inst Module {elems, datas, start} store = do
             let table = TableInstance lim (elems // zip [from..] (map Just funcs))
             return st { tableInstances = tableInstances st Vector.// [(idx, table)] }
 
-        checkData :: Store -> DataSegment -> Initialize (Int, IOVector Word8, LBS.ByteString)
+        checkData :: Store -> DataSegment -> Initialize (Int, MemoryStore, LBS.ByteString)
         checkData st DataSegment {memIndex, offset, chunk} = do
             VI32 val <- liftIO $ evalConstExpr inst st offset
             let from = fromIntegral val
@@ -524,13 +511,13 @@ initialize inst Module {elems, datas, start} store = do
             let last = from + (fromIntegral $ LBS.length chunk)
             let MemoryInstance _ memory = memInstances st ! idx
             mem <- liftIO $ readIORef memory
-            let len = IOVector.length mem
+            len <- ByteArray.getSizeofMutableByteArray mem
             Monad.when (last > len) $ throwError "data segment does not fit"
             return (from, mem, chunk)
         
-        initData :: (Int, IOVector Word8, LBS.ByteString) -> Initialize ()
+        initData :: (Int, MemoryStore, LBS.ByteString) -> Initialize ()
         initData (from, mem, chunk) =
-            mapM_ (\(i,b) -> IOVector.write mem i b) $ zip [from..] $ LBS.unpack chunk
+            mapM_ (\(i,b) -> ByteArray.writeByteArray mem i b) $ zip [from..] $ LBS.unpack chunk
 
 instantiate :: Store -> Imports -> Valid.ValidModule -> IO (Either String (ModuleInstance, Store))
 instantiate st imps mod = runExceptT $ do
@@ -603,32 +590,41 @@ eval budget store FunctionInstance { funcType, moduleInstance, code = Function {
                 Done ctx' -> go ctx' rest
                 command -> return command
         
-        makeLoadInstr :: (Bits i, Integral i) => EvalCtx -> Natural -> Int -> ([Value] -> i -> EvalResult) -> IO EvalResult
+        makeLoadInstr :: (Primitive.Prim i, Bits i, Integral i) => EvalCtx -> Natural -> Int -> ([Value] -> i -> EvalResult) -> IO EvalResult
         makeLoadInstr ctx@EvalCtx{ stack = (VI32 v:rest) } offset byteWidth cont = do
             let MemoryInstance { memory = memoryRef } = memInstances store ! (memaddrs moduleInstance ! 0)
             memory <- readIORef memoryRef
             let addr = fromIntegral v + fromIntegral offset
             let readByte idx = do
-                    byte <- IOVector.read memory $ addr + idx
+                    byte <- ByteArray.readByteArray @Word8 memory $ addr + idx
                     return $ fromIntegral byte `shiftL` (idx * 8)
-            if addr + byteWidth > IOVector.length memory
+            len <- ByteArray.getSizeofMutableByteArray memory
+            let isAligned = addr `rem` byteWidth == 0
+            if addr + byteWidth > len
             then return Trap
-            else cont rest . sum <$> mapM readByte [0..byteWidth-1]
+            else (
+                    if isAligned
+                    then cont rest <$> ByteArray.readByteArray memory (addr `quot` byteWidth)
+                    else cont rest . sum <$> mapM readByte [0..byteWidth-1]
+                )
         makeLoadInstr _ _ _ _ = error "Incorrect value on top of stack for memory instruction"
 
-        makeStoreInstr :: (Bits i, Integral i) => EvalCtx -> Natural -> Int -> i -> IO EvalResult
+        makeStoreInstr :: (Primitive.Prim i, Bits i, Integral i) => EvalCtx -> Natural -> Int -> i -> IO EvalResult
         makeStoreInstr ctx@EvalCtx{ stack = (VI32 va:rest) } offset byteWidth v = do
             let MemoryInstance { memory = memoryRef } = memInstances store ! (memaddrs moduleInstance ! 0)
             memory <- readIORef memoryRef
             let addr = fromIntegral $ va + fromIntegral offset
             let writeByte idx = do
                     let byte = fromIntegral $ v `shiftR` (idx * 8) .&. 0xFF
-                    IOVector.write memory (addr + idx) byte
-            if addr + byteWidth > IOVector.length memory
+                    ByteArray.writeByteArray @Word8 memory (addr + idx) byte
+            len <- ByteArray.getSizeofMutableByteArray memory
+            let isAligned = addr `rem` byteWidth == 0
+            let write = if isAligned
+                then ByteArray.writeByteArray memory (addr `quot` byteWidth) v
+                else mapM_ writeByte [0..byteWidth-1] :: IO ()
+            if addr + byteWidth > len
             then return Trap
-            else do
-                mapM_ writeByte [0..byteWidth-1]
-                return $ Done ctx { stack = rest }
+            else write >> (return $ Done ctx { stack = rest })
         makeStoreInstr _ _ _ _ = error "Incorrect value on top of stack for memory instruction"
 
         step :: EvalCtx -> Instruction Natural -> IO EvalResult
@@ -739,31 +735,31 @@ eval budget store FunctionInstance { funcType, moduleInstance, code = Function {
         step ctx (F64Load MemArg { offset }) =
             makeLoadInstr ctx offset 8 $ (\rest val -> Done ctx { stack = VF64 (wordToDouble val) : rest })
         step ctx (I32Load8U MemArg { offset }) =
-            makeLoadInstr ctx offset 1 $ (\rest val -> Done ctx { stack = VI32 val : rest })
+            makeLoadInstr @Word8 ctx offset 1 $ (\rest val -> Done ctx { stack = VI32 (fromIntegral val) : rest })
         step ctx (I32Load8S MemArg { offset }) =
             makeLoadInstr ctx offset 1 $ (\rest byte ->
                 let val = asWord32 $ if (byte :: Word8) >= 128 then -1 * fromIntegral (0xFF - byte + 1) else fromIntegral byte in
                 Done ctx { stack = VI32 val : rest })
         step ctx (I32Load16U MemArg { offset }) = do
-            makeLoadInstr ctx offset 2 $ (\rest val -> Done ctx { stack = VI32 val : rest })
+            makeLoadInstr @Word16 ctx offset 2 $ (\rest val -> Done ctx { stack = VI32 (fromIntegral val) : rest })
         step ctx (I32Load16S MemArg { offset }) =
             makeLoadInstr ctx offset 2 $ (\rest val ->
                 let signed = asWord32 $ if (val :: Word16) >= 2 ^ 15 then -1 * fromIntegral (0xFFFF - val + 1) else fromIntegral val in
                 Done ctx { stack = VI32 signed : rest })
         step ctx (I64Load8U MemArg { offset }) =
-            makeLoadInstr ctx offset 1 $ (\rest val -> Done ctx { stack = VI64 val : rest })
+            makeLoadInstr @Word8 ctx offset 1 $ (\rest val -> Done ctx { stack = VI64 (fromIntegral val) : rest })
         step ctx (I64Load8S MemArg { offset }) =
             makeLoadInstr ctx offset 1 $ (\rest byte ->
                 let val = asWord64 $ if (byte :: Word8) >= 128 then -1 * fromIntegral (0xFF - byte + 1) else fromIntegral byte in
                 Done ctx { stack = VI64 val : rest })
         step ctx (I64Load16U MemArg { offset }) =
-            makeLoadInstr ctx offset 2 $ (\rest val -> Done ctx { stack = VI64 val : rest })
+            makeLoadInstr @Word16 ctx offset 2 $ (\rest val -> Done ctx { stack = VI64 (fromIntegral val) : rest })
         step ctx (I64Load16S MemArg { offset }) =
             makeLoadInstr ctx offset 2 $ (\rest val ->
                 let signed = asWord64 $ if (val :: Word16) >= 2 ^ 15 then -1 * fromIntegral (0xFFFF - val + 1) else fromIntegral val in
                 Done ctx { stack = VI64 signed : rest })
         step ctx (I64Load32U MemArg { offset }) =
-            makeLoadInstr ctx offset 4 $ (\rest val -> Done ctx { stack = VI64 val : rest })
+            makeLoadInstr @Word32 ctx offset 4 $ (\rest val -> Done ctx { stack = VI64 (fromIntegral val) : rest })
         step ctx (I64Load32S MemArg { offset }) =
             makeLoadInstr ctx offset 4 $ (\rest val ->
                 let signed = asWord64 $ fromIntegral $ asInt32 val in
@@ -777,31 +773,35 @@ eval budget store FunctionInstance { funcType, moduleInstance, code = Function {
         step ctx@EvalCtx{ stack = (VF64 f:rest) } (F64Store MemArg { offset }) =
             makeStoreInstr ctx { stack = rest } offset 8 $ doubleToWord f
         step ctx@EvalCtx{ stack = (VI32 v:rest) } (I32Store8 MemArg { offset }) =
-            makeStoreInstr ctx { stack = rest } offset 1 v
+            makeStoreInstr @Word8 ctx { stack = rest } offset 1 $ fromIntegral v
         step ctx@EvalCtx{ stack = (VI32 v:rest) } (I32Store16 MemArg { offset }) =
-            makeStoreInstr ctx { stack = rest } offset 2 v
+            makeStoreInstr @Word16 ctx { stack = rest } offset 2 $ fromIntegral v
         step ctx@EvalCtx{ stack = (VI64 v:rest) } (I64Store8 MemArg { offset }) =
-            makeStoreInstr ctx { stack = rest } offset 1 v
+            makeStoreInstr @Word8 ctx { stack = rest } offset 1 $ fromIntegral v
         step ctx@EvalCtx{ stack = (VI64 v:rest) } (I64Store16 MemArg { offset }) =
-            makeStoreInstr ctx { stack = rest } offset 2 v
+            makeStoreInstr @Word16 ctx { stack = rest } offset 2 $ fromIntegral v
         step ctx@EvalCtx{ stack = (VI64 v:rest) } (I64Store32 MemArg { offset }) =
-            makeStoreInstr ctx { stack = rest } offset 4 v
+            makeStoreInstr @Word32 ctx { stack = rest } offset 4 $ fromIntegral v
         step ctx@EvalCtx{ stack = st } CurrentMemory = do
             let MemoryInstance { memory = memoryRef } = memInstances store ! (memaddrs moduleInstance ! 0)
             memory <- readIORef memoryRef
-            let size = fromIntegral $ IOVector.length memory `div` pageSize
-            return $ Done ctx { stack = VI32 size : st }
+            size <- ((`quot` pageSize) . fromIntegral) <$> ByteArray.getSizeofMutableByteArray memory
+            return $ Done ctx { stack = VI32 (fromIntegral size) : st }
         step ctx@EvalCtx{ stack = (VI32 n:rest) } GrowMemory = do
             let MemoryInstance { lim = limit@(Limit _ maxLen), memory = memoryRef } = memInstances store ! (memaddrs moduleInstance ! 0)
             memory <- readIORef memoryRef
-            let size = fromIntegral $ IOVector.length memory `quot` pageSize
+            size <- (`quot` pageSize) <$> ByteArray.getSizeofMutableByteArray memory
             let growTo = size + fromIntegral n
+            let w64PageSize = fromIntegral $ pageSize `div` 8
             result <- (
                     if fromMaybe True ((growTo <=) . fromIntegral <$> maxLen) && growTo <= 0xFFFF
-                    then do
-                        mem' <- IOVector.grow memory $ fromIntegral n * pageSize
-                        writeIORef memoryRef mem'
-                        return size
+                    then (
+                        if n == 0 then return size else do
+                            mem' <- ByteArray.resizeMutableByteArray memory $ growTo * pageSize
+                            ByteArray.setByteArray @Word64 mem' (size * w64PageSize) (fromIntegral n * w64PageSize) 0
+                            writeIORef memoryRef mem'
+                            return size
+                    )
                     else return $ -1
                 )
             return $ Done ctx { stack = VI32 (asWord32 $ fromIntegral result) : rest }
@@ -904,11 +904,11 @@ eval budget store FunctionInstance { funcType, moduleInstance, code = Function {
         step ctx@EvalCtx{ stack = (VI64 v2:VI64 v1:rest) } (IBinOp BS64 IXor) =
             return $ Done ctx { stack = VI64 (v1 `xor` v2) : rest }
         step ctx@EvalCtx{ stack = (VI64 v2:VI64 v1:rest) } (IBinOp BS64 IShl) =
-            return $ Done ctx { stack = VI64 (v1 `shiftL` (fromIntegral v2 `rem` 64)) : rest }
+            return $ Done ctx { stack = VI64 (v1 `shiftL` (fromIntegral (v2 `rem` 64))) : rest }
         step ctx@EvalCtx{ stack = (VI64 v2:VI64 v1:rest) } (IBinOp BS64 IShrU) =
-            return $ Done ctx { stack = VI64 (v1 `shiftR` (fromIntegral v2 `rem` 64)) : rest }
+            return $ Done ctx { stack = VI64 (v1 `shiftR` (fromIntegral (v2 `rem` 64))) : rest }
         step ctx@EvalCtx{ stack = (VI64 v2:VI64 v1:rest) } (IBinOp BS64 IShrS) =
-            return $ Done ctx { stack = VI64 (asWord64 $ asInt64 v1 `shiftR` (fromIntegral v2 `rem` 64)) : rest }
+            return $ Done ctx { stack = VI64 (asWord64 $ asInt64 v1 `shiftR` (fromIntegral (v2 `rem` 64))) : rest }
         step ctx@EvalCtx{ stack = (VI64 v2:VI64 v1:rest) } (IBinOp BS64 IRotl) =
             return $ Done ctx { stack = VI64 (v1 `rotateL` fromIntegral v2) : rest }
         step ctx@EvalCtx{ stack = (VI64 v2:VI64 v1:rest) } (IBinOp BS64 IRotr) =
