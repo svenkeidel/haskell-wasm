@@ -5,7 +5,12 @@
 
 module Language.Wasm.Interpreter (
     Value(..),
-    Store,
+    Store(..),
+    FunctionInstance(..),
+    HostFunction,
+    TableInstance(..),
+    MemoryInstance(..),
+    GlobalInstance(..),
     ModuleInstance(..),
     ExternalValue(..),
     ExportInstance(..),
