@@ -10,7 +10,6 @@ module Language.Wasm.Interpreter (
     HostFunction,
     TableInstance(..),
     MemoryInstance(..),
-    GlobalInstance(..),
     ModuleInstance(..),
     ExternalValue(..),
     ExportInstance(..),
