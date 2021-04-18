@@ -24,7 +24,20 @@ module Language.Wasm.Interpreter (
     emptyImports,
     emptyModInstance,
     makeHostModule,
-    makeMutGlobal
+    makeMutGlobal,
+    asInt32,
+    asInt64,
+    asWord32,
+    asWord64,
+    nearest,
+    zeroAwareMin,
+    zeroAwareMax,
+    floatFloor,
+    doubleFloor,
+    floatCeil,
+    doubleCeil,
+    floatTrunc,
+    doubleTrunc
 ) where
 
 import qualified Data.Map as Map
