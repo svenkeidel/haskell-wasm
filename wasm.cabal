@@ -36,11 +36,11 @@ library
       Language.Wasm.Interpreter
       Language.Wasm.Validate
       Language.Wasm
-  other-modules:
       Language.Wasm.Binary
       Language.Wasm.Builder
       Language.Wasm.FloatUtils
       Language.Wasm.Parser
+  other-modules:
       Paths_wasm
   autogen-modules:
       Paths_wasm
