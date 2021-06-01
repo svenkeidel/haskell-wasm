@@ -130,7 +130,10 @@ getSection sectionType parser def = do
     where
         parseSection op
             | op == 0 = skipCustomSection >> getSection sectionType parser def
-            | op == fromEnum sectionType = getWord8 >> (getULEB128 32 :: Get Natural) >> parser
+            | op == fromEnum sectionType = do
+                getWord8
+                len <- getULEB128 32
+                isolate len parser
             | op > fromEnum DataSection = fail "invalid section id"
             | op > fromEnum sectionType = return def
             | otherwise =
@@ -166,6 +169,29 @@ getResultType = do
         0x7D -> return [F32]
         0x7C -> return [F64]
         _ -> fail "unexpected byte in result type position"
+
+putBlockType :: BlockType -> Put
+putBlockType (Inline Nothing) = putWord8 0x40
+putBlockType (Inline (Just valType)) = put valType
+putBlockType (TypeIndex idx) = putSLEB128 idx
+
+getInlineBlockType :: Get (Maybe (Maybe ValueType))
+getInlineBlockType = do
+    op <- getWord8
+    case op of
+        0x40 -> return $ Just Nothing
+        0x7F -> return $ Just (Just I32)
+        0x7E -> return $ Just (Just I64)
+        0x7D -> return $ Just (Just F32)
+        0x7C -> return $ Just (Just F64)
+        _ -> return Nothing
+
+getBlockType :: Get BlockType
+getBlockType = do
+    inlineType <- lookAheadM getInlineBlockType
+    case inlineType of
+        Just inline -> return $ Inline inline
+        Nothing -> TypeIndex <$> getSLEB128 33
 
 data SectionType =
     CustomSection
@@ -217,8 +243,8 @@ instance Serialize FuncType where
         return $ FuncType { params, results }
 
 instance Serialize ElemType where
-    put AnyFunc = putWord8 0x70
-    get = byteGuard 0x70 >> return AnyFunc
+    put FuncRef = putWord8 0x70
+    get = byteGuard 0x70 >> return FuncRef
 
 instance Serialize Limit where
     put (Limit min Nothing) = putWord8 0x00 >> putULEB128 min
@@ -304,21 +330,21 @@ instance Serialize MemArg where
 instance Serialize (Instruction Natural) where
     put Unreachable = putWord8 0x00
     put Nop = putWord8 0x01
-    put (Block result body) = do
+    put (Block blockType body) = do
         putWord8 0x02
-        putResultType result
+        putBlockType blockType
         putExpression body
-    put (Loop result body) = do
+    put (Loop blockType body) = do
         putWord8 0x03
-        putResultType result
+        putBlockType blockType
         putExpression body
-    put If {resultType, true, false = []} = do
+    put If {blockType, true, false = []} = do
         putWord8 0x04
-        putResultType resultType
+        putBlockType blockType
         putExpression true
-    put If {resultType, true, false} = do
+    put If {blockType, true, false} = do
         putWord8 0x04
-        putResultType resultType
+        putBlockType blockType
         mapM_ put true
         putWord8 0x05 -- ELSE
         putExpression false
@@ -492,18 +518,34 @@ instance Serialize (Instruction Natural) where
     put (FReinterpretI BS32) = putWord8 0xBE
     put (FReinterpretI BS64) = putWord8 0xBF
 
+    put (IUnOp BS32 IExtend8S) = putWord8 0xC0
+    put (IUnOp BS32 IExtend16S) = putWord8 0xC1
+    put (IUnOp BS32 IExtend32S) = error "Opcode for i32.extend32_s doesn't exist"
+    put (IUnOp BS64 IExtend8S) = putWord8 0xC2
+    put (IUnOp BS64 IExtend16S) = putWord8 0xC3
+    put (IUnOp BS64 IExtend32S) = putWord8 0xC4
+
+    put (ITruncSatFS BS32 BS32) = putWord8 0xFC >> putULEB128 (0x00 :: Word32)
+    put (ITruncSatFU BS32 BS32) = putWord8 0xFC >> putULEB128 (0x01 :: Word32)
+    put (ITruncSatFS BS32 BS64) = putWord8 0xFC >> putULEB128 (0x02 :: Word32)
+    put (ITruncSatFU BS32 BS64) = putWord8 0xFC >> putULEB128 (0x03 :: Word32)
+    put (ITruncSatFS BS64 BS32) = putWord8 0xFC >> putULEB128 (0x04 :: Word32)
+    put (ITruncSatFU BS64 BS32) = putWord8 0xFC >> putULEB128 (0x05 :: Word32)
+    put (ITruncSatFS BS64 BS64) = putWord8 0xFC >> putULEB128 (0x06 :: Word32)
+    put (ITruncSatFU BS64 BS64) = putWord8 0xFC >> putULEB128 (0x07 :: Word32)
+
     get = do
         op <- getWord8
         case op of
             0x00 -> return Unreachable
             0x01 -> return Nop
-            0x02 -> Block <$> getResultType <*> getExpression
-            0x03 -> Loop <$> getResultType <*> getExpression
+            0x02 -> Block <$> getBlockType <*> getExpression
+            0x03 -> Loop <$> getBlockType <*> getExpression
             0x04 -> do
-                resultType <- getResultType
+                blockType <- getBlockType
                 (true, hasElse) <- getTrueBranch
                 false <- if hasElse then getExpression else return []
-                return $ If resultType true false
+                return $ If blockType true false
             0x0C -> Br <$> getULEB128 32
             0x0D -> BrIf <$> getULEB128 32
             0x0E -> BrTable <$> (map unIndex <$> getVec) <*> getULEB128 32
@@ -676,6 +718,23 @@ instance Serialize (Instruction Natural) where
             0xBD -> return $ IReinterpretF BS64
             0xBE -> return $ FReinterpretI BS32
             0xBF -> return $ FReinterpretI BS64
+            0xC0 -> return $ IUnOp BS32 IExtend8S
+            0xC1 -> return $ IUnOp BS32 IExtend16S
+            0xC2 -> return $ IUnOp BS64 IExtend8S
+            0xC3 -> return $ IUnOp BS64 IExtend16S
+            0xC4 -> return $ IUnOp BS64 IExtend32S
+            0xFC -> do -- misc
+                ext <- getULEB128 32
+                case (ext :: Word32) of
+                    0x00 -> return $ ITruncSatFS BS32 BS32
+                    0x01 -> return $ ITruncSatFU BS32 BS32
+                    0x02 -> return $ ITruncSatFS BS32 BS64
+                    0x03 -> return $ ITruncSatFU BS32 BS64
+                    0x04 -> return $ ITruncSatFS BS64 BS32
+                    0x05 -> return $ ITruncSatFU BS64 BS32
+                    0x06 -> return $ ITruncSatFS BS64 BS64
+                    0x07 -> return $ ITruncSatFU BS64 BS64
+                    _ -> fail "Unknown byte value after misc instruction byte"
             _ -> fail "Unknown byte value in place of instruction opcode"
 
 putExpression :: Expression -> Put
@@ -757,7 +816,10 @@ instance Serialize Function where
         putByteString bs
     get = do
         _size <- getULEB128 32 :: Get Natural
-        locals <- concat . map (\(LocalTypeRange n val) -> replicate (fromIntegral n) val) <$> getVec
+        localRanges <- getVec
+        let localLen = sum $ map (\(LocalTypeRange n _) -> n) localRanges
+        if localLen < 2^32 then return () else fail "too many locals"
+        let locals = concat $ map (\(LocalTypeRange n val) -> replicate (fromIntegral n) val) localRanges 
         body <- getExpression
         return $ Function 0 locals body
 

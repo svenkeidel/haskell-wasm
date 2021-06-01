@@ -30,6 +30,7 @@ module Language.Wasm.Structure (
     GlobalType(..),
     FuncType(..),
     ValueType(..),
+    BlockType(..),
     ParamsType,
     ResultType,
     LocalsType,
@@ -57,7 +58,14 @@ import GHC.Generics (Generic)
 
 data BitSize = BS32 | BS64 deriving (Show, Eq, Generic, NFData)
 
-data IUnOp = IClz | ICtz | IPopcnt deriving (Show, Eq, Generic, NFData)
+data IUnOp =
+    IClz
+    | ICtz
+    | IPopcnt
+    | IExtend8S
+    | IExtend16S
+    | IExtend32S
+    deriving (Show, Eq, Generic, NFData)
 
 data IBinOp =
     IAdd
@@ -108,13 +116,18 @@ type LocalsType = [ValueType]
 
 data FuncType = FuncType { params :: ParamsType, results :: ResultType } deriving (Show, Eq, Generic, NFData)
 
+data BlockType =
+    Inline (Maybe ValueType)
+    | TypeIndex TypeIndex
+    deriving (Show, Eq, Generic, NFData)
+
 data Instruction index =
     -- Control instructions
     Unreachable
     | Nop
-    | Block { resultType :: ResultType, body :: Expression }
-    | Loop { resultType :: ResultType, body :: Expression }
-    | If { resultType :: ResultType, true :: Expression, false :: Expression }
+    | Block { blockType :: BlockType, body :: Expression }
+    | Loop { blockType :: BlockType, body :: Expression }
+    | If { blockType :: BlockType, true :: Expression, false :: Expression }
     | Br index
     | BrIf index
     | BrTable [index] index
@@ -172,6 +185,8 @@ data Instruction index =
     | I32WrapI64
     | ITruncFU {- Int Size -} BitSize {- Float Size -} BitSize
     | ITruncFS {- Int Size -} BitSize {- Float Size -} BitSize
+    | ITruncSatFU {- Int Size -} BitSize {- Float Size -} BitSize
+    | ITruncSatFS {- Int Size -} BitSize {- Float Size -} BitSize
     | I64ExtendSI32
     | I64ExtendUI32
     | FConvertIU {- Float Size -} BitSize {- Int Size -} BitSize
@@ -192,7 +207,7 @@ data Function = Function {
 
 data Limit = Limit Natural (Maybe Natural) deriving (Show, Eq, Generic, NFData)
 
-data ElemType = AnyFunc deriving (Show, Eq, Generic, NFData)
+data ElemType = FuncRef deriving (Show, Eq, Generic, NFData)
 
 data TableType = TableType Limit ElemType deriving (Show, Eq, Generic, NFData)
 

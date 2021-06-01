@@ -10,7 +10,14 @@ module Language.Wasm (
     decode,
     decodeLazy,
     Script,
-    runScript
+    Command(..),
+    ModuleDef(..),
+    Action(..),
+    Assertion(..),
+    Ident(..),
+    Meta(..),
+    runScript,
+    Valid.getModule
 ) where
 
 import qualified Data.ByteString as BS

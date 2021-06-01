@@ -37,7 +37,8 @@ module Language.Wasm.Interpreter (
     floatCeil,
     doubleCeil,
     floatTrunc,
-    doubleTrunc
+    doubleTrunc,
+    makeConstGlobal
 ) where
 
 import qualified Data.Map as Map
@@ -55,7 +56,6 @@ import Data.Word (Word8, Word16, Word32, Word64)
 import Data.Int (Int32, Int64)
 import Numeric.Natural (Natural)
 import qualified Control.Monad as Monad
-import Data.Monoid ((<>))
 import Data.Bits (
         Bits,
         (.|.),
@@ -71,6 +71,7 @@ import Data.Bits (
     )
 import Numeric.IEEE (IEEE, copySign, minNum, maxNum, identicalIEEE)
 import Control.Monad.Except (ExceptT, runExceptT, throwError)
+import qualified Control.Monad.State as State
 import Control.Monad.IO.Class (liftIO)
 
 import Language.Wasm.Structure as Struct
@@ -196,6 +197,9 @@ data GlobalInstance = GIConst ValueType Value | GIMut ValueType (IORef Value)
 makeMutGlobal :: Value -> IO GlobalInstance
 makeMutGlobal val = GIMut (getValueType val) <$> newIORef val
 
+makeConstGlobal :: Value -> GlobalInstance
+makeConstGlobal val = GIConst (getValueType val) val
+
 getValueType :: Value -> ValueType
 getValueType (VI32 _) = I32
 getValueType (VI64 _) = I64
@@ -298,7 +302,7 @@ makeHostModule st items = do
         makeHostTables :: (Store, ModuleInstance) -> IO (Store, ModuleInstance)
         makeHostTables (st, inst) = do
             let tableLen = Vector.length $ tableInstances st
-            let (names, tables) = unzip [(name, Table (TableType lim AnyFunc)) | (name, (HostTable lim)) <- items]
+            let (names, tables) = unzip [(name, Table (TableType lim FuncRef)) | (name, (HostTable lim)) <- items]
             let instances = allocTables tables
             let exps = Vector.fromList $ zipWith (\name i -> ExportInstance name (ExternTable i)) names [tableLen..]
             let inst' = inst {
@@ -383,13 +387,11 @@ calcInstance (Store fs ts ms gs) imps Module {functions, types, tables, mems, gl
                 ExternGlobal globalAddr -> return globalAddr
                 _ -> err
             let globalInst = gs ! globalAddr
-            let vt = case globalType of
-                    Const vt -> vt
-                    Mut vt -> vt
-            let vt' = case globalInst of
-                    GIConst vt _ -> vt
-                    GIMut vt _ -> vt
-            if vt == vt' then return idx else err
+            let typesMatch = case (globalType, globalInst) of
+                    (Const vt, GIConst vt' _) -> vt == vt'
+                    (Mut vt, GIMut vt' _) -> vt == vt'
+                    _ -> False
+            if typesMatch then return idx else err
         checkImportType imp@(Import _ _ (ImportMemory limit)) = do
             idx <- getImpIdx imp
             memAddr <- case idx of
@@ -485,25 +487,27 @@ allocMems mems = Vector.fromList <$> mapM allocMem mems
                 memory
             }
 
-type Initialize = ExceptT String IO
+type Initialize = ExceptT String (State.StateT Store IO)
 
-initialize :: ModuleInstance -> Module -> Store -> Initialize Store
-initialize inst Module {elems, datas, start} store = do
-    checkedMems <- mapM (checkData store) datas
-    checkedTables <- mapM (checkElem store) elems
+initialize :: ModuleInstance -> Module -> Initialize ()
+initialize inst Module {elems, datas, start} = do
+    checkedMems <- mapM checkData datas
+    checkedTables <- mapM checkElem elems
     mapM_ initData checkedMems
-    st <- Monad.foldM initElem store checkedTables
+    mapM_ initElem checkedTables
+    st <- State.get
     case start of
         Just (StartFunction idx) -> do
-            let funInst = funcInstances store ! (funcaddrs inst ! fromIntegral idx)
+            let funInst = funcInstances st ! (funcaddrs inst ! fromIntegral idx)
             mainRes <- liftIO $ eval defaultBudget st funInst []
             case mainRes of
-                Just [] -> return st
+                Just [] -> return ()
                 _ -> throwError "Start function terminated with trap"
-        Nothing -> return st
+        Nothing -> return ()
     where
-        checkElem :: Store -> ElemSegment -> Initialize (Address, Int, [Address])
-        checkElem st ElemSegment {tableIndex, offset, funcIndexes} = do
+        checkElem :: ElemSegment -> Initialize (Address, Int, [Address])
+        checkElem ElemSegment {tableIndex, offset, funcIndexes} = do
+            st <- State.get
             VI32 val <- liftIO $ evalConstExpr inst st offset
             let from = fromIntegral val
             let funcs = map ((funcaddrs inst !) . fromIntegral) funcIndexes
@@ -514,14 +518,15 @@ initialize inst Module {elems, datas, start} store = do
             Monad.when (last > len) $ throwError "elements segment does not fit"
             return (idx, from, funcs)
 
-        initElem :: Store -> (Address, Int, [Address]) -> Initialize Store
-        initElem st (idx, from, funcs) = do
-            let TableInstance lim elems = tableInstances st ! idx
-            let table = TableInstance lim (elems // zip [from..] (map Just funcs))
-            return st { tableInstances = tableInstances st Vector.// [(idx, table)] }
+        initElem :: (Address, Int, [Address]) -> Initialize ()
+        initElem (idx, from, funcs) = State.modify $ \st ->
+            let TableInstance lim elems = tableInstances st ! idx in
+            let table = TableInstance lim (elems // zip [from..] (map Just funcs)) in
+            st { tableInstances = tableInstances st Vector.// [(idx, table)] }
 
-        checkData :: Store -> DataSegment -> Initialize (Int, MemoryStore, LBS.ByteString)
-        checkData st DataSegment {memIndex, offset, chunk} = do
+        checkData :: DataSegment -> Initialize (Int, MemoryStore, LBS.ByteString)
+        checkData DataSegment {memIndex, offset, chunk} = do
+            st <- State.get
             VI32 val <- liftIO $ evalConstExpr inst st offset
             let from = fromIntegral val
             let idx = memaddrs inst ! fromIntegral memIndex
@@ -536,21 +541,22 @@ initialize inst Module {elems, datas, start} store = do
         initData (from, mem, chunk) =
             mapM_ (\(i,b) -> ByteArray.writeByteArray mem i b) $ zip [from..] $ LBS.unpack chunk
 
-instantiate :: Store -> Imports -> Valid.ValidModule -> IO (Either String (ModuleInstance, Store))
-instantiate st imps mod = runExceptT $ do
+instantiate :: Store -> Imports -> Valid.ValidModule -> IO (Either String ModuleInstance, Store)
+instantiate st imps mod = flip State.runStateT st $ runExceptT $ do
     let m = Valid.getModule mod
     inst <- calcInstance st imps m
     let functions = funcInstances st <> (allocFunctions inst $ Struct.functions m)
     globals <- liftIO $ (globalInstances st <>) <$> (allocAndInitGlobals inst st $ Struct.globals m)
     let tables = tableInstances st <> (allocTables $ Struct.tables m)
     mems <- liftIO $ (memInstances st <>) <$> (allocMems $ Struct.mems m)
-    st' <- initialize inst m $ st {
+    State.put $ st {
         funcInstances = functions,
         tableInstances = tables,
         memInstances = mems,
         globalInstances = globals
     }
-    return $ (inst, st')
+    initialize inst m
+    return inst
 
 type Stack = [Value]
 
@@ -647,32 +653,44 @@ eval budget store FunctionInstance { funcType, moduleInstance, code = Function {
         step :: EvalCtx -> Instruction Natural -> IO EvalResult
         step _ Unreachable = return Trap
         step ctx Nop = return $ Done ctx
-        step ctx (Block resType expr) = do
+        step ctx (Block blockType expr) = do
+            let FuncType paramType resType = case blockType of
+                    Inline Nothing -> FuncType [] []
+                    Inline (Just valType) -> FuncType [] [valType]
+                    TypeIndex typeIdx -> funcTypes moduleInstance ! fromIntegral typeIdx
             res <- go ctx { labels = Label resType : labels ctx } expr
             case res of
-                Break 0 r EvalCtx{ locals = ls } -> return $ Done ctx { locals = ls, stack = r ++ stack ctx }
+                Break 0 r EvalCtx{ locals = ls } -> return $ Done ctx { locals = ls, stack = r ++ (drop (length paramType) $ stack ctx) }
                 Break n r ctx' -> return $ Break (n - 1) r ctx'
                 Done ctx'@EvalCtx{ labels = (_:rest) } -> return $ Done ctx' { labels = rest }
                 command -> return command
-        step ctx loop@(Loop resType expr) = do
+        step ctx loop@(Loop blockType expr) = do
+            let resType = case blockType of
+                    Inline Nothing -> []
+                    Inline (Just valType) -> [valType]
+                    TypeIndex typeIdx -> results $ funcTypes moduleInstance ! fromIntegral typeIdx
             res <- go ctx { labels = Label resType : labels ctx } expr
             case res of
-                Break 0 r EvalCtx{ locals = ls } -> step ctx { locals = ls, stack = r ++ stack ctx } loop
+                Break 0 r EvalCtx{ locals = ls, stack = st } -> step ctx { locals = ls, stack = st } loop
                 Break n r ctx' -> return $ Break (n - 1) r ctx'
                 Done ctx'@EvalCtx{ labels = (_:rest) } -> return $ Done ctx' { labels = rest }
                 command -> return command
-        step ctx@EvalCtx{ stack = (VI32 v): rest } (If resType true false) = do
+        step ctx@EvalCtx{ stack = (VI32 v): rest } (If blockType true false) = do
+            let FuncType paramType resType = case blockType of
+                    Inline Nothing -> FuncType [] []
+                    Inline (Just valType) -> FuncType [] [valType]
+                    TypeIndex typeIdx -> funcTypes moduleInstance ! fromIntegral typeIdx
             let expr = if v /= 0 then true else false
             res <- go ctx { labels = Label resType : labels ctx, stack = rest } expr
             case res of
-                Break 0 r EvalCtx{ locals = ls } -> return $ Done ctx { locals = ls, stack = r ++ rest }
+                Break 0 r EvalCtx{ locals = ls } -> return $ Done ctx { locals = ls, stack = r ++ (drop (length paramType) rest) }
                 Break n r ctx' -> return $ Break (n - 1) r ctx'
                 Done ctx'@EvalCtx{ labels = (_:rest) } -> return $ Done ctx' { labels = rest }
                 command -> return command
         step ctx@EvalCtx{ stack, labels } (Br label) = do
             let idx = fromIntegral label
             let Label resType = labels !! idx
-            case sequence $ zipWith checkValType resType $ take (length resType) stack of
+            case sequence $ zipWith checkValType (reverse resType) $ take (length resType) stack of
                 Just result -> return $ Break idx result ctx
                 Nothing -> return Trap
         step ctx@EvalCtx{ stack = (VI32 v): rest } (BrIf label) =
@@ -685,7 +703,7 @@ eval budget store FunctionInstance { funcType, moduleInstance, code = Function {
             step ctx { stack = rest } (Br lbl)
         step EvalCtx{ stack } Return =
             let resType = results funcType in
-            case sequence $ zipWith checkValType resType $ take (length resType) stack of
+            case sequence $ zipWith checkValType (reverse resType) $ take (length resType) stack of
                 Just result -> return $ ReturnFn $ reverse result
                 Nothing -> return Trap
         step ctx (Call fun) = do
@@ -892,6 +910,16 @@ eval budget store FunctionInstance { funcType, moduleInstance, code = Function {
             return $ Done ctx { stack = VI32 (fromIntegral $ countTrailingZeros v) : rest }
         step ctx@EvalCtx{ stack = (VI32 v:rest) } (IUnOp BS32 IPopcnt) =
             return $ Done ctx { stack = VI32 (fromIntegral $ popCount v) : rest }
+        step ctx@EvalCtx{ stack = (VI32 v:rest) } (IUnOp BS32 IExtend8S) =
+            let byte = v .&. 0xFF in
+            let r = if byte >= 0x80 then asWord32 (fromIntegral byte - 0x100) else byte in
+            return $ Done ctx { stack = VI32 r : rest }
+        step ctx@EvalCtx{ stack = (VI32 v:rest) } (IUnOp BS32 IExtend16S) =
+            let half = v .&. 0xFFFF in
+            let r = if half >= 0x8000 then asWord32 (fromIntegral half - 0x10000) else half in
+            return $ Done ctx { stack = VI32 r : rest }
+        step ctx@EvalCtx{ stack = (VI32 v:rest) } (IUnOp BS32 IExtend32S) =
+            return $ Done ctx { stack = VI32 v : rest }
         step ctx@EvalCtx{ stack = (VI64 v2:VI64 v1:rest) } (IBinOp BS64 IAdd) =
             return $ Done ctx { stack = VI64 (v1 + v2) : rest }
         step ctx@EvalCtx{ stack = (VI64 v2:VI64 v1:rest) } (IBinOp BS64 ISub) =
@@ -958,6 +986,18 @@ eval budget store FunctionInstance { funcType, moduleInstance, code = Function {
             return $ Done ctx { stack = VI64 (fromIntegral $ countTrailingZeros v) : rest }
         step ctx@EvalCtx{ stack = (VI64 v:rest) } (IUnOp BS64 IPopcnt) =
             return $ Done ctx { stack = VI64 (fromIntegral $ popCount v) : rest }
+        step ctx@EvalCtx{ stack = (VI64 v:rest) } (IUnOp BS64 IExtend8S) =
+            let byte = v .&. 0xFF in
+            let r = if byte >= 0x80 then asWord64 (fromIntegral byte - 0x100) else byte in
+            return $ Done ctx { stack = VI64 r : rest }
+        step ctx@EvalCtx{ stack = (VI64 v:rest) } (IUnOp BS64 IExtend16S) =
+            let quart = v .&. 0xFFFF in
+            let r = if quart >= 0x8000 then asWord64 (fromIntegral quart - 0x10000) else quart in
+            return $ Done ctx { stack = VI64 r : rest }
+        step ctx@EvalCtx{ stack = (VI64 v:rest) } (IUnOp BS64 IExtend32S) =
+            let half = v .&. 0xFFFFFFFF in
+            let r = if half >= 0x80000000 then asWord64 (fromIntegral half - 0x100000000) else half in
+            return $ Done ctx { stack = VI64 r : rest }
         step ctx@EvalCtx{ stack = (VF32 v:rest) } (FUnOp BS32 FAbs) =
             return $ Done ctx { stack = VF32 (abs v) : rest }
         step ctx@EvalCtx{ stack = (VF32 v:rest) } (FUnOp BS32 FNeg) =
@@ -1057,21 +1097,81 @@ eval budget store FunctionInstance { funcType, moduleInstance, code = Function {
             then return Trap
             else return $ Done ctx { stack = VI64 (truncate v) : rest }
         step ctx@EvalCtx{ stack = (VF32 v:rest) } (ITruncFS BS32 BS32) =
-            if isNaN v || isInfinite v || v >= 2^31 || v < -2^31
+            if isNaN v || isInfinite v || v >= 2^31 || v < -2^31 - 1
             then return Trap
             else return $ Done ctx { stack = VI32 (asWord32 $ truncate v) : rest }
         step ctx@EvalCtx{ stack = (VF64 v:rest) } (ITruncFS BS32 BS64) =
-            if isNaN v || isInfinite v || v >= 2^31 || v < -2^31
+            if isNaN v || isInfinite v || v >= 2^31 || v <= -2^31 - 1
             then return Trap
             else return $ Done ctx { stack = VI32 (asWord32 $ truncate v) : rest }
         step ctx@EvalCtx{ stack = (VF32 v:rest) } (ITruncFS BS64 BS32) =
-            if isNaN v || isInfinite v || v >= 2^63 || v < -2^63
+            if isNaN v || isInfinite v || v >= 2^63 || v < -2^63 - 1
             then return Trap
             else return $ Done ctx { stack = VI64 (asWord64 $ truncate v) : rest }
         step ctx@EvalCtx{ stack = (VF64 v:rest) } (ITruncFS BS64 BS64) =
-            if isNaN v || isInfinite v || v >= 2^63 || v < -2^63
+            if isNaN v || isInfinite v || v >= 2^63 || v < -2^63 - 1
             then return Trap
             else return $ Done ctx { stack = VI64 (asWord64 $ truncate v) : rest }
+
+        step ctx@EvalCtx{ stack = (VF32 v:rest) } (ITruncSatFS BS32 BS32) | isNaN v =
+            return $ Done ctx { stack = VI32 0 : rest }
+        step ctx@EvalCtx{ stack = (VF64 v:rest) } (ITruncSatFS BS32 BS64) | isNaN v =
+            return $ Done ctx { stack = VI32 0 : rest }
+        step ctx@EvalCtx{ stack = (VF32 v:rest) } (ITruncSatFS BS64 BS32) | isNaN v =
+            return $ Done ctx { stack = VI64 0 : rest }
+        step ctx@EvalCtx{ stack = (VF64 v:rest) } (ITruncSatFS BS64 BS64) | isNaN v =
+            return $ Done ctx { stack = VI64 0 : rest }
+        step ctx@EvalCtx{ stack = (VF32 v:rest) } (ITruncSatFU BS32 BS32) | v <= -1 || isNaN v =
+            return $ Done ctx { stack = VI32 0 : rest }
+        step ctx@EvalCtx{ stack = (VF64 v:rest) } (ITruncSatFU BS32 BS64) | v <= -1 || isNaN v =
+            return $ Done ctx { stack = VI32 0 : rest }
+        step ctx@EvalCtx{ stack = (VF32 v:rest) } (ITruncSatFU BS64 BS32) | v <= -1 || isNaN v =
+            return $ Done ctx { stack = VI64 0 : rest }
+        step ctx@EvalCtx{ stack = (VF64 v:rest) } (ITruncSatFU BS64 BS64) | v <= -1 || isNaN v =
+            return $ Done ctx { stack = VI64 0 : rest }
+
+        step ctx@EvalCtx{ stack = (VF32 v:rest) } (ITruncSatFS BS32 BS32) | v >= 2^31 =
+            return $ Done ctx { stack = VI32 0x7fffffff : rest }
+        step ctx@EvalCtx{ stack = (VF64 v:rest) } (ITruncSatFS BS32 BS64) | v >= 2^31 =
+            return $ Done ctx { stack = VI32 0x7fffffff : rest }
+        step ctx@EvalCtx{ stack = (VF32 v:rest) } (ITruncSatFS BS64 BS32) | v >= 2^63 =
+            return $ Done ctx { stack = VI64 0x7fffffffffffffff : rest }
+        step ctx@EvalCtx{ stack = (VF64 v:rest) } (ITruncSatFS BS64 BS64) | v >= 2^63 =
+            return $ Done ctx { stack = VI64 0x7fffffffffffffff : rest }
+        step ctx@EvalCtx{ stack = (VF32 v:rest) } (ITruncSatFU BS32 BS32) | v >= 2^32 =
+            return $ Done ctx { stack = VI32 0xffffffff : rest }
+        step ctx@EvalCtx{ stack = (VF64 v:rest) } (ITruncSatFU BS32 BS64) | v >= 2^32 =
+            return $ Done ctx { stack = VI32 0xffffffff : rest }
+        step ctx@EvalCtx{ stack = (VF32 v:rest) } (ITruncSatFU BS64 BS32) | v >= 2^64 =
+            return $ Done ctx { stack = VI64 0xffffffffffffffff : rest }
+        step ctx@EvalCtx{ stack = (VF64 v:rest) } (ITruncSatFU BS64 BS64) | v >= 2^64 =
+            return $ Done ctx { stack = VI64 0xffffffffffffffff : rest }
+        
+        step ctx@EvalCtx{ stack = (VF32 v:rest) } (ITruncSatFS BS32 BS32) | v <= -2^31 - 1 =
+            return $ Done ctx { stack = VI32 0x80000000 : rest }
+        step ctx@EvalCtx{ stack = (VF64 v:rest) } (ITruncSatFS BS32 BS64) | v <= -2^31 - 1 =
+            return $ Done ctx { stack = VI32 0x80000000 : rest }
+        step ctx@EvalCtx{ stack = (VF32 v:rest) } (ITruncSatFS BS64 BS32) | v <= -2^63 - 1 =
+            return $ Done ctx { stack = VI64 0x8000000000000000 : rest }
+        step ctx@EvalCtx{ stack = (VF64 v:rest) } (ITruncSatFS BS64 BS64) | v <= -2^63 - 1 =
+            return $ Done ctx { stack = VI64 0x8000000000000000 : rest }
+
+        step ctx@EvalCtx{ stack = (VF32 v:rest) } (ITruncSatFU BS32 BS32) =
+            return $ Done ctx { stack = VI32 (truncate v) : rest }
+        step ctx@EvalCtx{ stack = (VF64 v:rest) } (ITruncSatFU BS32 BS64) =
+            return $ Done ctx { stack = VI32 (truncate v) : rest }
+        step ctx@EvalCtx{ stack = (VF32 v:rest) } (ITruncSatFU BS64 BS32) =
+            return $ Done ctx { stack = VI64 (truncate v) : rest }
+        step ctx@EvalCtx{ stack = (VF64 v:rest) } (ITruncSatFU BS64 BS64) =
+            return $ Done ctx { stack = VI64 (truncate v) : rest }
+        step ctx@EvalCtx{ stack = (VF32 v:rest) } (ITruncSatFS BS32 BS32) =
+            return $ Done ctx { stack = VI32 (asWord32 $ truncate v) : rest }
+        step ctx@EvalCtx{ stack = (VF64 v:rest) } (ITruncSatFS BS32 BS64) =
+            return $ Done ctx { stack = VI32 (asWord32 $ truncate v) : rest }
+        step ctx@EvalCtx{ stack = (VF32 v:rest) } (ITruncSatFS BS64 BS32) =
+            return $ Done ctx { stack = VI64 (asWord64 $ truncate v) : rest }
+        step ctx@EvalCtx{ stack = (VF64 v:rest) } (ITruncSatFS BS64 BS64) =
+            return $ Done ctx { stack = VI64 (asWord64 $ truncate v) : rest }
         step ctx@EvalCtx{ stack = (VI32 v:rest) } I64ExtendUI32 =
             return $ Done ctx { stack = VI64 (fromIntegral v) : rest }
         step ctx@EvalCtx{ stack = (VI32 v:rest) } I64ExtendSI32 =

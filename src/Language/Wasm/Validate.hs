@@ -34,10 +34,10 @@ data ValidationError =
     | MoreThanOneMemory
     | MoreThanOneTable
     | FunctionIndexOutOfRange
-    | TableIndexOutOfRange
-    | MemoryIndexOutOfRange
-    | LocalIndexOutOfRange
-    | GlobalIndexOutOfRange
+    | TableIndexOutOfRange Natural
+    | MemoryIndexOutOfRange Natural
+    | LocalIndexOutOfRange Natural
+    | GlobalIndexOutOfRange Natural
     | LabelIndexOutOfRange
     | TypeIndexOutOfRange
     | ResultTypeDoesntMatch
@@ -45,8 +45,6 @@ data ValidationError =
     | InvalidResultArity
     | InvalidConstantExpr
     | InvalidStartFunctionType
-    | ImportedGlobalIsNotConst
-    | ExportedGlobalIsNotConst
     | GlobalIsImmutable
     deriving (Show, Eq)
 
@@ -100,7 +98,7 @@ data Arrow = Arrow End End deriving (Show, Eq)
 (==>) a b = Arrow (toEnd a) (toEnd b)
 
 asArrow :: FuncType -> Arrow
-asArrow (FuncType params results) = Arrow (map Val params) (map Val results)
+asArrow (FuncType params results) = Arrow (map Val params) (map Val $ reverse results)
 
 isArrowMatch :: Arrow -> Arrow -> Bool
 isArrowMatch (f `Arrow` t) ( f' `Arrow` t') = isEndMatch f f' && isEndMatch t t'
@@ -132,8 +130,8 @@ data Ctx = Ctx {
     mems :: [Limit],
     globals :: [GlobalType],
     locals :: [ValueType],
-    labels :: [Maybe ValueType],
-    returns :: Maybe ValueType,
+    labels :: [[ValueType]],
+    returns :: [ValueType],
     importedGlobals :: Natural
 } deriving (Show, Eq)
 
@@ -166,7 +164,7 @@ shouldBeMut :: GlobalType -> Checker ()
 shouldBeMut (Mut _) = return ()
 shouldBeMut (Const v) = throwError GlobalIsImmutable
 
-getLabel :: LabelIndex -> Checker (Maybe ValueType)
+getLabel :: LabelIndex -> Checker [ValueType]
 getLabel lbl = do
     Ctx { labels } <- ask
     case labels !? lbl of
@@ -174,7 +172,7 @@ getLabel lbl = do
         Just v -> return v
 
 withLabel :: [ValueType] -> Checker a -> Checker a
-withLabel result = withReaderT (\ctx -> ctx { labels = safeHead result : labels ctx })
+withLabel result = withReaderT (\ctx -> ctx { labels = result : labels ctx })
 
 isMemArgValid :: Int -> MemArg -> Checker ()
 isMemArgValid sizeInBytes MemArg { align } = if 2 ^ align <= sizeInBytes then return () else throwError AlignmentOverflow
@@ -183,52 +181,74 @@ checkMemoryInstr :: Int -> MemArg -> Checker ()
 checkMemoryInstr size memarg = do
     isMemArgValid size memarg
     Ctx { mems } <- ask 
-    if length mems < 1 then throwError MemoryIndexOutOfRange else return ()
+    if length mems < 1 then throwError (MemoryIndexOutOfRange 0) else return ()
+
+getBlockType :: BlockType -> Checker Arrow
+getBlockType (Inline Nothing) = return $ empty ==> empty
+getBlockType (Inline (Just valType)) = return $ empty ==> valType
+getBlockType (TypeIndex typeIdx) = do
+    Ctx { types } <- ask
+    maybeToEither TypeIndexOutOfRange $ asArrow <$> types !? typeIdx
+
+getResultType :: BlockType -> Checker [ValueType]
+getResultType (Inline Nothing) = return []
+getResultType (Inline (Just valType)) = return [valType]
+getResultType (TypeIndex typeIdx) = do
+    Ctx { types } <- ask
+    maybeToEither TypeIndexOutOfRange $ results <$> types !? typeIdx
 
 getInstrType :: Instruction Natural -> Checker Arrow
 getInstrType Unreachable = return $ Any ==> Any
 getInstrType Nop = return $ empty ==> empty
-getInstrType Block { resultType, body } = do
-    let blockType = empty ==> resultType
-    t <- withLabel resultType $ getExpressionType body
-    if isArrowMatch t blockType
-    then return $ empty ==> resultType
-    else throwError $ TypeMismatch t blockType
-getInstrType Loop { resultType, body } = do
-    let blockType = empty ==> resultType
-    t <- withLabel [] $ getExpressionType body
-    if isArrowMatch t blockType
-    then return $ empty ==> resultType
-    else throwError $ TypeMismatch t blockType
-getInstrType If { resultType, true, false } = do
-    let blockType = empty ==> resultType
-    l <- withLabel resultType $ getExpressionType true
-    r <- withLabel resultType $ getExpressionType false
-    if isArrowMatch l blockType
-    then (if isArrowMatch r blockType then (return $ I32 ==> resultType) else (throwError $ TypeMismatch r blockType))
-    else throwError $ TypeMismatch l blockType
+getInstrType Block { blockType, body } = do
+    bt@(Arrow from _) <- getBlockType blockType
+    resultType <- getResultType blockType
+    t <- withLabel resultType $ getExpressionTypeWithInput from body
+    if isArrowMatch t bt
+    then return bt
+    else throwError $ TypeMismatch t bt
+getInstrType Loop { blockType, body } = do
+    bt@(Arrow from _) <- getBlockType blockType
+    resultType <- getResultType blockType
+    t <- withLabel (map (\(Val v) -> v) from) $ getExpressionTypeWithInput from body
+    if isArrowMatch t bt
+    then return bt
+    else throwError $ TypeMismatch t bt
+getInstrType If { blockType, true, false } = do
+    bt@(Arrow from _) <- getBlockType blockType
+    resultType <- getResultType blockType
+    l <- withLabel resultType $ getExpressionTypeWithInput from true
+    r <- withLabel resultType $ getExpressionTypeWithInput from false
+    if isArrowMatch l bt
+    then (
+            if isArrowMatch r bt
+            then let Arrow from to = bt in
+                (return $ (from ++ [Val I32]) ==> to)
+            else (throwError $ TypeMismatch r bt)
+        )
+    else throwError $ TypeMismatch l bt
 getInstrType (Br lbl) = do
-    r <- map Val . maybeToList <$> getLabel lbl
+    r <- map Val <$> getLabel lbl
     return $ (Any : r) ==> Any
 getInstrType (BrIf lbl) = do
-    r <- map Val . maybeToList <$> getLabel lbl
+    r <- map Val <$> getLabel lbl
     return $ (r ++ [Val I32]) ==> r
 getInstrType (BrTable lbls lbl) = do
     r <- getLabel lbl
     rs <- mapM getLabel lbls
     if all (== r) rs
-    then return $ ([Any] ++ (map Val $ maybeToList r) ++ [Val I32]) ==> Any
+    then return $ ([Any] ++ (map Val r) ++ [Val I32]) ==> Any
     else throwError ResultTypeDoesntMatch
 getInstrType Return = do
     Ctx { returns } <- ask
-    return $ (Any : (map Val $ maybeToList returns)) ==> Any
+    return $ (Any : (map Val returns)) ==> Any
 getInstrType (Call fun) = do
     Ctx { funcs } <- ask
     maybeToEither FunctionIndexOutOfRange $ asArrow <$> funcs !? fun
 getInstrType (CallIndirect sign) = do
     Ctx { types, tables } <- ask
     if length tables < 1
-    then throwError TableIndexOutOfRange
+    then throwError (TableIndexOutOfRange 0)
     else do
         Arrow from to <- maybeToEither TypeIndexOutOfRange $ asArrow <$> types !? sign
         return $ (from ++ [Val I32]) ==> to
@@ -240,23 +260,23 @@ getInstrType Select = do
     return $ [var, var, Val I32] ==> var
 getInstrType (GetLocal local) = do
     Ctx { locals }  <- ask
-    t <- maybeToEither LocalIndexOutOfRange $ locals !? local
+    t <- maybeToEither (LocalIndexOutOfRange local) $ locals !? local
     return $ empty ==> Val t
 getInstrType (SetLocal local) = do
     Ctx { locals } <- ask
-    t <- maybeToEither LocalIndexOutOfRange $ locals !? local
+    t <- maybeToEither (LocalIndexOutOfRange local) $ locals !? local
     return $ Val t ==> empty
 getInstrType (TeeLocal local) = do
     Ctx { locals } <- ask
-    t <- maybeToEither LocalIndexOutOfRange $ locals !? local
+    t <- maybeToEither (LocalIndexOutOfRange local) $ locals !? local
     return $ Val t ==> Val t
 getInstrType (GetGlobal global) = do
     Ctx { globals } <- ask
-    t <- maybeToEither GlobalIndexOutOfRange $ asType <$> globals !? global
+    t <- maybeToEither (GlobalIndexOutOfRange global) $ asType <$> globals !? global
     return $ empty ==> t
 getInstrType (SetGlobal global) = do
     Ctx { globals } <- ask
-    t <- maybeToEither GlobalIndexOutOfRange $ asType <$> globals !? global
+    t <- maybeToEither (GlobalIndexOutOfRange global) $ asType <$> globals !? global
     shouldBeMut $ globals !! fromIntegral global
     return $ t ==> empty
 getInstrType (I32Load memarg) = do
@@ -299,7 +319,7 @@ getInstrType (I64Load32S memarg) = do
     checkMemoryInstr 4 memarg
     return $ I32 ==> I64
 getInstrType (I64Load32U memarg) = do
-    checkMemoryInstr 8 memarg
+    checkMemoryInstr 4 memarg
     return $ I32 ==> I64
 getInstrType (I32Store memarg) = do
     checkMemoryInstr 4 memarg
@@ -330,10 +350,10 @@ getInstrType (I64Store32 memarg) = do
     return $ [I32, I64] ==> empty
 getInstrType CurrentMemory = do
     Ctx { mems } <- ask 
-    if length mems < 1 then throwError MemoryIndexOutOfRange else return $ empty ==> I32
+    if length mems < 1 then throwError (MemoryIndexOutOfRange 0) else return $ empty ==> I32
 getInstrType GrowMemory = do
     Ctx { mems } <- ask 
-    if length mems < 1 then throwError MemoryIndexOutOfRange else return $ I32 ==> I32
+    if length mems < 1 then throwError (MemoryIndexOutOfRange 0) else return $ I32 ==> I32
 getInstrType (I32Const _) = return $ empty ==> I32
 getInstrType (I64Const _) = return $ empty ==> I64
 getInstrType (F32Const _) = return $ empty ==> F32
@@ -361,6 +381,14 @@ getInstrType (ITruncFS BS32 BS32) = return $ F32 ==> I32
 getInstrType (ITruncFS BS32 BS64) = return $ F64 ==> I32
 getInstrType (ITruncFS BS64 BS32) = return $ F32 ==> I64
 getInstrType (ITruncFS BS64 BS64) = return $ F64 ==> I64
+getInstrType (ITruncSatFU BS32 BS32) = return $ F32 ==> I32
+getInstrType (ITruncSatFU BS32 BS64) = return $ F64 ==> I32
+getInstrType (ITruncSatFU BS64 BS32) = return $ F32 ==> I64
+getInstrType (ITruncSatFU BS64 BS64) = return $ F64 ==> I64
+getInstrType (ITruncSatFS BS32 BS32) = return $ F32 ==> I32
+getInstrType (ITruncSatFS BS32 BS64) = return $ F64 ==> I32
+getInstrType (ITruncSatFS BS64 BS32) = return $ F32 ==> I64
+getInstrType (ITruncSatFS BS64 BS64) = return $ F64 ==> I64
 getInstrType I64ExtendSI32 = return $ I32 ==> I64
 getInstrType I64ExtendUI32 = return $ I32 ==> I64
 getInstrType (FConvertIU BS32 BS32) = return $ I32 ==> F32
@@ -383,8 +411,8 @@ replace :: (Eq a) => a -> a -> [a] -> [a]
 replace _ _ [] = []
 replace x y (v:r) = (if x == v then y else v) : replace x y r
 
-getExpressionType :: Expression -> Checker Arrow
-getExpressionType = fmap ([] `Arrow`) . foldM go []
+getExpressionTypeWithInput :: [VType] -> Expression -> Checker Arrow
+getExpressionTypeWithInput inp = fmap (inp `Arrow`) . foldM go inp
     where
         go :: [VType] -> Instruction Natural -> Checker [VType]
         go stack instr = do
@@ -401,9 +429,15 @@ getExpressionType = fmap ([] `Arrow`) . foldM go []
         matchStack (Val v:stack) (Var:args) res =
             let subst = replace Var (Val v) in
             matchStack stack (subst args) (subst res)
+        matchStack (Var:stack) (Val v:args) res =
+            let subst = replace Var (Val v) in
+            matchStack stack (subst args) (subst res)
         matchStack stack [] res = return $ res ++ stack
         matchStack [] args res = throwError $ TypeMismatch ((reverse args) `Arrow` res) ([] `Arrow` [])
         matchStack _ _ _ = error "inconsistent checker state"
+
+getExpressionType :: Expression -> Checker Arrow
+getExpressionType = getExpressionTypeWithInput []
 
 isConstExpression :: Expression -> Checker ()
 isConstExpression [] = return ()
@@ -414,7 +448,7 @@ isConstExpression ((F64Const _):rest) = isConstExpression rest
 isConstExpression ((GetGlobal idx):rest) = do
     Ctx {globals, importedGlobals} <- ask
     if importedGlobals <= idx
-        then throwError GlobalIndexOutOfRange
+        then throwError (GlobalIndexOutOfRange idx)
         else return ()
     case globals !! fromIntegral idx of
         Const _ -> isConstExpression rest
@@ -429,7 +463,7 @@ getFuncTypes Module {types, functions, imports} =
         getFuncType (Import _ _ (ImportFunc typeIdx)) = Just $ types !! (fromIntegral typeIdx)
         getFuncType _ = Nothing
 
-ctxFromModule :: [ValueType] -> [Maybe ValueType] -> Maybe ValueType -> Module -> Ctx
+ctxFromModule :: [ValueType] -> [[ValueType]] -> [ValueType] -> Module -> Ctx
 ctxFromModule locals labels returns m@Module {types, tables, mems, globals, imports} =
     let tableImports = catMaybes $ map getTableType imports in
     let memsImports = catMaybes $ map getMemType imports in
@@ -458,17 +492,13 @@ ctxFromModule locals labels returns m@Module {types, tables, mems, globals, impo
 isFunctionValid :: Function -> Validator
 isFunctionValid Function {funcType, localTypes = locals, body} mod@Module {types} =
     if fromIntegral funcType < length types
-    then
-        let FuncType params results = types !! fromIntegral funcType in
-        if length results > 1
-        then Left InvalidResultArity
-        else do
-            let r = safeHead results
-            let ctx = ctxFromModule (params ++ locals) [r] r mod
-            arr <- runChecker ctx $ getExpressionType body
-            if isArrowMatch arr (empty ==> results)
-            then return ()
-            else Left $ TypeMismatch arr (empty ==> results)
+    then do
+        let FuncType params results = types !! fromIntegral funcType
+        let ctx = ctxFromModule (params ++ locals) [results] results mod
+        arr <- runChecker ctx $ getExpressionType body
+        if isArrowMatch arr (empty ==> (reverse results))
+        then return ()
+        else Left $ TypeMismatch arr (empty ==> (reverse results))
     else Left TypeIndexOutOfRange
 
 functionsShouldBeValid :: Validator
@@ -507,7 +537,7 @@ memoryShouldBeValid Module { imports, mems } =
 
 globalsShouldBeValid :: Validator
 globalsShouldBeValid m@Module { imports, globals } =
-    let ctx = ctxFromModule [] [] Nothing m in
+    let ctx = ctxFromModule [] [] [] m in
     foldMap (isGlobalValid ctx) globals
     where
         getGlobalType :: GlobalType -> ValueType
@@ -523,7 +553,7 @@ globalsShouldBeValid m@Module { imports, globals } =
 
 elemsShouldBeValid :: Validator
 elemsShouldBeValid m@Module { elems, functions, tables, imports } =
-    let ctx = ctxFromModule [] [] Nothing m in
+    let ctx = ctxFromModule [] [] [] m in
     foldMap (isElemValid ctx) elems
     where
         isElemValid :: Ctx -> ElemSegment -> ValidationResult
@@ -539,7 +569,7 @@ elemsShouldBeValid m@Module { elems, functions, tables, imports } =
             let isTableIndexValid =
                     if tableIdx < (fromIntegral $ length tableImports + length tables)
                     then return ()
-                    else Left TableIndexOutOfRange
+                    else Left (TableIndexOutOfRange tableIdx)
             in
             let funImports = filter isFuncImport imports in
             let funsLength = fromIntegral $ length functions + length funImports in
@@ -548,7 +578,7 @@ elemsShouldBeValid m@Module { elems, functions, tables, imports } =
 
 datasShouldBeValid :: Validator
 datasShouldBeValid m@Module { datas, mems, imports } =
-    let ctx = ctxFromModule [] [] Nothing m in
+    let ctx = ctxFromModule [] [] [] m in
     foldMap (isDataValid ctx) datas
     where
         isDataValid :: Ctx -> DataSegment -> ValidationResult
@@ -563,7 +593,7 @@ datasShouldBeValid m@Module { datas, mems, imports } =
             let memImports = filter isMemImport imports in
             if memIdx < (fromIntegral $ length memImports + length mems)
             then check
-            else Left MemoryIndexOutOfRange
+            else Left (MemoryIndexOutOfRange memIdx)
 
 startShouldBeValid :: Validator
 startShouldBeValid Module { start = Nothing } = return ()
@@ -587,21 +617,13 @@ exportsShouldBeValid Module { exports, imports, functions, mems, tables, globals
         isExportValid (Export _ (ExportFunc funIdx)) =
             if fromIntegral funIdx < length funcImports + length functions then return () else Left FunctionIndexOutOfRange
         isExportValid (Export _ (ExportTable tableIdx)) =
-            if fromIntegral tableIdx < length tableImports + length tables then return () else Left TableIndexOutOfRange
+            if fromIntegral tableIdx < length tableImports + length tables then return () else Left (TableIndexOutOfRange tableIdx)
         isExportValid (Export _ (ExportMemory memIdx)) =
-            if fromIntegral memIdx < length memImports + length mems then return () else Left MemoryIndexOutOfRange
+            if fromIntegral memIdx < length memImports + length mems then return () else Left (MemoryIndexOutOfRange memIdx)
         isExportValid (Export _ (ExportGlobal globalIdx)) =
             if fromIntegral globalIdx < length globalImports + length globals
-            then (
-                if fromIntegral globalIdx >= length globalImports
-                then (
-                    case globals !! (fromIntegral globalIdx - length globalImports) of
-                        (Global (Mut _) _) -> Left ExportedGlobalIsNotConst
-                        _ -> return ()
-                )
-                else return ()
-            )
-            else Left GlobalIndexOutOfRange
+            then return ()
+            else Left (GlobalIndexOutOfRange globalIdx)
 
         areExportNamesUnique :: ValidationResult
         areExportNamesUnique =
@@ -626,14 +648,7 @@ importsShouldBeValid Module { imports, types } =
             else Left TypeIndexOutOfRange
         isImportValid (Import _ _ (ImportTable _)) = return () -- checked in tables section
         isImportValid (Import _ _ (ImportMemory _)) = return () -- checked in mems section
-        isImportValid (Import _ _ (ImportGlobal (Const _))) = return ()
-        isImportValid (Import _ _ (ImportGlobal (Mut _))) = Left ImportedGlobalIsNotConst
-
-typesShouldBeValid :: Validator
-typesShouldBeValid Module { types } = foldMap isTypeValid types
-    where
-        isTypeValid :: FuncType -> ValidationResult
-        isTypeValid FuncType { results } = if length results <= 1 then return () else Left InvalidResultArity
+        isImportValid (Import _ _ (ImportGlobal _)) = return ()
 
 newtype ValidModule = ValidModule { getModule :: Module } deriving (Show, Eq)
 
@@ -642,7 +657,6 @@ validate mod = const (ValidModule mod) <$> foldMap ($ mod) validators
     where
         validators :: [Validator]
         validators = [
-                typesShouldBeValid,
                 functionsShouldBeValid,
                 tablesShouldBeValid,
                 memoryShouldBeValid,

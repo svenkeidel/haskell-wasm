@@ -7,19 +7,21 @@ module Language.Wasm.Lexer (
     AlexPosn(..),
     scanner,
     asFloat,
-    asDouble
+    asDouble,
+    doubleFromInteger
 ) where
 
 import qualified Data.ByteString.Lazy as LBS
 import qualified Data.Char as Char
 import qualified Data.ByteString.Lazy.UTF8 as LBSUtf8
-import Control.Applicative ((<$>))
 import Control.Monad (when)
-import Numeric.IEEE (infinity, nan)
-import Language.Wasm.FloatUtils (makeNaN, doubleToFloat)
-import Data.Word (Word8)
+import Numeric.IEEE (infinity, nan, nanWithPayload)
+import Language.Wasm.FloatUtils (makeNaN, doubleToFloat, wordToFloat, wordToDouble)
+import Data.Word (Word8, Word64)
 import Data.List (isPrefixOf)
 import Text.Read (readEither)
+import Data.Bits
+import Numeric (showHex)
 
 }
 
@@ -63,6 +65,8 @@ tokens :-
 <0> "nan"                                 { constToken $ TFloatLit $ BinRep (abs nan) }
 <0> "+nan"                                { constToken $ TFloatLit $ BinRep (abs nan) }
 <0> "-nan"                                { constToken $ TFloatLit $ BinRep nan }
+<0> "nan:canonical"                       { constToken $ TFloatLit $ NanRep Canonical }
+<0> "nan:arithmetic"                      { constToken $ TFloatLit $ NanRep Arithmetic }
 <0> $sign? @nanhex                        { parseNanSigned }
 <0> "inf"                                 { constToken $ TFloatLit $ BinRep inf }
 <0> "+inf"                                { constToken $ TFloatLit $ BinRep inf }
@@ -130,9 +134,13 @@ parseHexalSignedInt = token $ \(pos, _, s, _) len ->
 
 parseNanSigned :: AlexAction Lexeme
 parseNanSigned = token $ \(pos, _, s, _) len -> 
-    let (sign, slen) = parseSign s in
+    let (sign, slen) = case LBSUtf8.decode s of
+            Just ('-', _) -> (False, 1)
+            Just ('+', _) -> (True, 1)
+            otherwise -> (True, 0)
+    in
     let num = readHexFromPrefix (len - 6 - slen) $ LBSUtf8.drop (6 + slen) s in
-    Lexeme (Just pos) $ TFloatLit $ BinRep $ sign $ makeNaN $ fromIntegral num
+    Lexeme (Just pos) $ TFloatLit $ NanRep $ NanHex sign $ fromIntegral num
 
 parseDecimalSignedInt :: AlexAction Lexeme
 parseDecimalSignedInt = token $ \(pos, _, s, _) len ->
@@ -184,44 +192,85 @@ parseHexFloat :: AlexAction Lexeme
 parseHexFloat = token $ \(pos, _, s, _) len ->
     Lexeme (Just pos) $ TFloatLit $ HexRep $ filter (/= '_') $ takeChars len s
 
-readHexFloat :: Int -> String -> String -> Either String Double
-readHexFloat expLimit restrictedPrefix str =
+readHexFloat :: (Integral w, Bits w) => (w -> f) -> Int -> Int -> Int -> String -> Either String f
+readHexFloat toFloat sz expLimit manitisaSize str = do
     let (sign, '0':'x':rest) = case str of
-            ('+':rest) -> (abs, rest)
-            ('-':rest) -> (negate, rest)
-            rest -> (abs, rest)
-    in
-    let (val, exp) = splitBy (\c -> c == 'P' || c == 'p') rest in
-    let (int, frac) = splitBy (== '.') val in
-    let intLen = length int in
-    let expInt = expAsInt exp in
-    if int == "1" && ((restrictedPrefix `isPrefixOf` frac && expInt == expLimit - 1) || expInt >= expLimit)
-    then Left $ "constant out of range"
-    else
-        let intVal = sum $ zipWith (\i c -> readHexFromChar c * (16 ^ (intLen - i))) [1..] int in
-        Right $ sign $ (intVal + readHexFrac frac) * readHexExp exp
-    where
-        readHexExp :: String -> Double
-        readHexExp [] = 1
-        readHexExp ('+' : rest) = readHexExp rest
-        readHexExp ('-' : rest) = 1 / readHexExp rest
-        readHexExp expStr = 2 ^ read expStr
+            ('+':rest) -> (0, rest)
+            ('-':rest) -> (1 `shiftL` (sz - 1), rest)
+            rest -> (0, rest)
+    let (val, expStr) = splitBy (\c -> c == 'P' || c == 'p') rest
+    let (intRaw, fracRaw) = splitBy (== '.') val
+    let int = dropWhile (== '0') intRaw
+    let fracWithZeros = int ++ (reverse $ dropWhile (== '0') $ reverse fracRaw)
+    let frac = dropWhile (== '0') fracWithZeros
+    let exp = expAsInt expStr + length int * 4 - (length $ takeWhile (== '0') fracWithZeros) * 4
+    if length frac == 0
+    then return $ toFloat sign
+    else do
+        let fracBits = reverse $ dropWhile (== False) $ reverse $ toBits frac
+        let exp' = exp - (length $ takeWhile (== False) fracBits) - 1
+        let bits = dropWhile (== False) fracBits
+        let budget = min (manitisaSize + 1) $ (expLimit + manitisaSize) + exp'
+        let (bits', a, exp'') = if length bits <= budget
+                then (bits, 0, exp')
+                else do
+                    let rounded = take budget bits
+                    let rest = drop budget bits
+                    if head rest == True && (length rest > 1 || (length rounded > 0 && last rounded == True))
+                    then do
+                        if length rounded > 0 && all (== True) rounded
+                        then ([True], 0, exp' + 1)
+                        else (rounded, 1, exp')
+                    else (rounded, 0, exp')
+        if exp'' > expLimit || exp'' < (negate $ expLimit + manitisaSize) then Left "constant out of range" else return ()
+        if exp'' >= (negate $ expLimit - 1)
+        then return $ toFloat $ sign .|. ((fromIntegral $ exp'' + expLimit) `shiftL` manitisaSize) .|. ((fromBits (tail bits') + a) `shiftL` (manitisaSize + 1 - length bits'))
+        else do
+            let shift = expLimit + manitisaSize - length bits' - abs exp''
+            if shift < 0
+            then return $ toFloat sign
+            else return $ toFloat $ sign .|. ((fromBits bits' + a) `shiftL` shift)
 
-        readHexFrac :: String -> Double
-        readHexFrac [] = 0
-        readHexFrac val =
-            let len = length val in
-            sum $ zipWith (\i c -> readHexFromChar c / (16 ^ i)) [1..] val
+type BitString = [Bool]
+
+toBits :: String -> BitString
+toBits = concat . map (asBits . readHexFromChar)
+    where
+        asBits :: Word8 -> BitString
+        asBits w = [
+                if w .&. 8 == 0 then False else True,
+                if w .&. 4 == 0 then False else True,
+                if w .&. 2 == 0 then False else True,
+                if w .&. 1 == 0 then False else True
+            ]
+
+fromBits :: (Integral i) => BitString -> i
+fromBits = foldr (\b acc -> acc * 2 + if b then 1 else 0) 0 . reverse . dropWhile (== False)
 
 asFloat :: FloatRep -> Either String Float
 asFloat (BinRep d) = Right $ doubleToFloat d
-asFloat (HexRep s) = doubleToFloat <$> readHexFloat 128 "ffffff" s
+asFloat (HexRep s) = readHexFloat wordToFloat 32 127 23 s
 asFloat (DecRep s) = readDecFloat s
+asFloat (NanRep Canonical) = Right nan
+asFloat (NanRep Arithmetic) = Right nan
+asFloat (NanRep (NanHex isPos payload)) =
+    if payload >= 1 && payload < 2 ^ 23
+    then return $ doubleToFloat $ (if isPos then id else negate) $ makeNaN payload
+    else Left "constant out of range"
 
 asDouble :: FloatRep -> Either String Double
 asDouble (BinRep d) = Right d
-asDouble (HexRep s) = readHexFloat 1024 "fffffffffffff8" s
+asDouble (HexRep s) = readHexFloat wordToDouble 64 1023 52 s
 asDouble (DecRep s) = readDecDouble s
+asDouble (NanRep Canonical) = Right nan
+asDouble (NanRep Arithmetic) = Right nan
+asDouble (NanRep (NanHex isPos payload)) =
+    if payload >= 1 && payload < 2 ^ 52
+    then return $ (if isPos then id else negate) $ makeNaN payload
+    else Left "constant out of range"
+
+doubleFromInteger :: Integer -> Either String Double
+doubleFromInteger int = asDouble . HexRep . ((if int < 0 then "-0x" else "0x") ++) . flip showHex "" $ abs int
 
 startBlockComment :: AlexAction Lexeme
 startBlockComment _inp _len = do
@@ -299,6 +348,13 @@ data FloatRep
     = BinRep Double
     | DecRep String
     | HexRep String
+    | NanRep NaN
+    deriving (Show, Eq)
+
+data NaN
+    = Canonical
+    | Arithmetic
+    | NanHex Bool Word64
     deriving (Show, Eq)
 
 data Token = TKeyword LBS.ByteString

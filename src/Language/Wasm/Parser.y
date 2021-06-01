@@ -66,9 +66,10 @@ import qualified Data.Text.Lazy.Read as TLRead
 
 import qualified Data.ByteString.Lazy as LBS
 import qualified Data.ByteString.Lazy.Char8 as LBSChar8
-import Data.Maybe (fromMaybe, fromJust, isNothing)
-import Data.List (foldl', findIndex, find)
+import Data.Maybe (fromMaybe, fromJust, isNothing, catMaybes)
+import Data.List (foldl', findIndex, find, nub)
 import Control.Monad (guard, foldM)
+import Control.Monad.Except (throwError)
 
 import Numeric.Natural (Natural)
 import Data.Word (Word32, Word64)
@@ -93,7 +94,8 @@ import Language.Wasm.Lexer (
         Lexeme(..),
         AlexPosn(..),
         asFloat,
-        asDouble
+        asDouble,
+        doubleFromInteger
     )
 
 }
@@ -116,7 +118,7 @@ import Language.Wasm.Lexer (
 'f32'                 { Lexeme _ (TKeyword "f32") }
 'f64'                 { Lexeme _ (TKeyword "f64") }
 'mut'                 { Lexeme _ (TKeyword "mut") }
-'anyfunc'             { Lexeme _ (TKeyword "anyfunc") }
+'funcref'             { Lexeme _ (TKeyword "funcref") }
 'type'                { Lexeme _ (TKeyword "type") }
 'unreachable'         { Lexeme _ (TKeyword "unreachable") }
 'nop'                 { Lexeme _ (TKeyword "nop") }
@@ -128,11 +130,11 @@ import Language.Wasm.Lexer (
 'call_indirect'       { Lexeme _ (TKeyword "call_indirect") }
 'drop'                { Lexeme _ (TKeyword "drop") }
 'select'              { Lexeme _ (TKeyword "select") }
-'get_local'           { Lexeme _ (TKeyword "get_local") }
-'set_local'           { Lexeme _ (TKeyword "set_local") }
-'tee_local'           { Lexeme _ (TKeyword "tee_local") }
-'get_global'          { Lexeme _ (TKeyword "get_global") }
-'set_global'          { Lexeme _ (TKeyword "set_global") }
+'get_local'           { Lexeme _ (TKeyword "local.get") }
+'set_local'           { Lexeme _ (TKeyword "local.set") }
+'tee_local'           { Lexeme _ (TKeyword "local.tee") }
+'get_global'          { Lexeme _ (TKeyword "global.get") }
+'set_global'          { Lexeme _ (TKeyword "global.set") }
 'i32.load'            { Lexeme _ (TKeyword "i32.load") }
 'i64.load'            { Lexeme _ (TKeyword "i64.load") }
 'f32.load'            { Lexeme _ (TKeyword "f32.load") }
@@ -156,8 +158,6 @@ import Language.Wasm.Lexer (
 'i64.store8'          { Lexeme _ (TKeyword "i64.store8") }
 'i64.store16'         { Lexeme _ (TKeyword "i64.store16") }
 'i64.store32'         { Lexeme _ (TKeyword "i64.store32") }
-'current_memory'      { Lexeme _ (TKeyword "current_memory") }
-'grow_memory'         { Lexeme _ (TKeyword "grow_memory") }
 'memory.size'         { Lexeme _ (TKeyword "memory.size") }
 'memory.grow'         { Lexeme _ (TKeyword "memory.grow") }
 'i32.const'           { Lexeme _ (TKeyword "i32.const") }
@@ -167,6 +167,8 @@ import Language.Wasm.Lexer (
 'i32.clz'             { Lexeme _ (TKeyword "i32.clz") }
 'i32.ctz'             { Lexeme _ (TKeyword "i32.ctz") }
 'i32.popcnt'          { Lexeme _ (TKeyword "i32.popcnt") }
+'i32.extend8_s'       { Lexeme _ (TKeyword "i32.extend8_s") }
+'i32.extend16_s'      { Lexeme _ (TKeyword "i32.extend16_s") }
 'i32.add'             { Lexeme _ (TKeyword "i32.add") }
 'i32.sub'             { Lexeme _ (TKeyword "i32.sub") }
 'i32.mul'             { Lexeme _ (TKeyword "i32.mul") }
@@ -185,6 +187,9 @@ import Language.Wasm.Lexer (
 'i64.clz'             { Lexeme _ (TKeyword "i64.clz") }
 'i64.ctz'             { Lexeme _ (TKeyword "i64.ctz") }
 'i64.popcnt'          { Lexeme _ (TKeyword "i64.popcnt") }
+'i64.extend8_s'       { Lexeme _ (TKeyword "i64.extend8_s") }
+'i64.extend16_s'      { Lexeme _ (TKeyword "i64.extend16_s") }
+'i64.extend32_s'      { Lexeme _ (TKeyword "i64.extend32_s") }
 'i64.add'             { Lexeme _ (TKeyword "i64.add") }
 'i64.sub'             { Lexeme _ (TKeyword "i64.sub") }
 'i64.mul'             { Lexeme _ (TKeyword "i64.mul") }
@@ -262,31 +267,39 @@ import Language.Wasm.Lexer (
 'f64.gt'              { Lexeme _ (TKeyword "f64.gt") }
 'f64.le'              { Lexeme _ (TKeyword "f64.le") }
 'f64.ge'              { Lexeme _ (TKeyword "f64.ge") }
-'i32.wrap/i64'        { Lexeme _ (TKeyword "i32.wrap/i64") }
-'i32.trunc_s/f32'     { Lexeme _ (TKeyword "i32.trunc_s/f32") }
-'i32.trunc_u/f32'     { Lexeme _ (TKeyword "i32.trunc_u/f32") }
-'i32.trunc_s/f64'     { Lexeme _ (TKeyword "i32.trunc_s/f64") }
-'i32.trunc_u/f64'     { Lexeme _ (TKeyword "i32.trunc_u/f64") }
-'i64.extend_s/i32'    { Lexeme _ (TKeyword "i64.extend_s/i32") }
-'i64.extend_u/i32'    { Lexeme _ (TKeyword "i64.extend_u/i32") }
-'i64.trunc_s/f32'     { Lexeme _ (TKeyword "i64.trunc_s/f32") }
-'i64.trunc_u/f32'     { Lexeme _ (TKeyword "i64.trunc_u/f32") }
-'i64.trunc_s/f64'     { Lexeme _ (TKeyword "i64.trunc_s/f64") }
-'i64.trunc_u/f64'     { Lexeme _ (TKeyword "i64.trunc_u/f64") }
-'f32.convert_s/i32'   { Lexeme _ (TKeyword "f32.convert_s/i32") }
-'f32.convert_u/i32'   { Lexeme _ (TKeyword "f32.convert_u/i32") }
-'f32.convert_s/i64'   { Lexeme _ (TKeyword "f32.convert_s/i64") }
-'f32.convert_u/i64'   { Lexeme _ (TKeyword "f32.convert_u/i64") }
-'f32.demote/f64'      { Lexeme _ (TKeyword "f32.demote/f64") }
-'f64.convert_s/i32'   { Lexeme _ (TKeyword "f64.convert_s/i32") }
-'f64.convert_u/i32'   { Lexeme _ (TKeyword "f64.convert_u/i32") }
-'f64.convert_s/i64'   { Lexeme _ (TKeyword "f64.convert_s/i64") }
-'f64.convert_u/i64'   { Lexeme _ (TKeyword "f64.convert_u/i64") }
-'f64.promote/f32'     { Lexeme _ (TKeyword "f64.promote/f32") }
-'i32.reinterpret/f32' { Lexeme _ (TKeyword "i32.reinterpret/f32") }
-'i64.reinterpret/f64' { Lexeme _ (TKeyword "i64.reinterpret/f64") }
-'f32.reinterpret/i32' { Lexeme _ (TKeyword "f32.reinterpret/i32") }
-'f64.reinterpret/i64' { Lexeme _ (TKeyword "f64.reinterpret/i64") }
+'i32.wrap_i64'        { Lexeme _ (TKeyword "i32.wrap_i64") }
+'i32.trunc_f32_s'     { Lexeme _ (TKeyword "i32.trunc_f32_s") }
+'i32.trunc_f32_u'     { Lexeme _ (TKeyword "i32.trunc_f32_u") }
+'i32.trunc_f64_s'     { Lexeme _ (TKeyword "i32.trunc_f64_s") }
+'i32.trunc_f64_u'     { Lexeme _ (TKeyword "i32.trunc_f64_u") }
+'i32.trunc_sat_f32_s' { Lexeme _ (TKeyword "i32.trunc_sat_f32_s") }
+'i32.trunc_sat_f32_u' { Lexeme _ (TKeyword "i32.trunc_sat_f32_u") }
+'i32.trunc_sat_f64_s' { Lexeme _ (TKeyword "i32.trunc_sat_f64_s") }
+'i32.trunc_sat_f64_u' { Lexeme _ (TKeyword "i32.trunc_sat_f64_u") }
+'i64.extend_i32_s'    { Lexeme _ (TKeyword "i64.extend_i32_s") }
+'i64.extend_i32_u'    { Lexeme _ (TKeyword "i64.extend_i32_u") }
+'i64.trunc_f32_s'     { Lexeme _ (TKeyword "i64.trunc_f32_s") }
+'i64.trunc_f32_u'     { Lexeme _ (TKeyword "i64.trunc_f32_u") }
+'i64.trunc_f64_s'     { Lexeme _ (TKeyword "i64.trunc_f64_s") }
+'i64.trunc_f64_u'     { Lexeme _ (TKeyword "i64.trunc_f64_u") }
+'i64.trunc_sat_f32_s' { Lexeme _ (TKeyword "i64.trunc_sat_f32_s") }
+'i64.trunc_sat_f32_u' { Lexeme _ (TKeyword "i64.trunc_sat_f32_u") }
+'i64.trunc_sat_f64_s' { Lexeme _ (TKeyword "i64.trunc_sat_f64_s") }
+'i64.trunc_sat_f64_u' { Lexeme _ (TKeyword "i64.trunc_sat_f64_u") }
+'f32.convert_i32_s'   { Lexeme _ (TKeyword "f32.convert_i32_s") }
+'f32.convert_i32_u'   { Lexeme _ (TKeyword "f32.convert_i32_u") }
+'f32.convert_i64_s'   { Lexeme _ (TKeyword "f32.convert_i64_s") }
+'f32.convert_i64_u'   { Lexeme _ (TKeyword "f32.convert_i64_u") }
+'f32.demote_f64'      { Lexeme _ (TKeyword "f32.demote_f64") }
+'f64.convert_i32_s'   { Lexeme _ (TKeyword "f64.convert_i32_s") }
+'f64.convert_i32_u'   { Lexeme _ (TKeyword "f64.convert_i32_u") }
+'f64.convert_i64_s'   { Lexeme _ (TKeyword "f64.convert_i64_s") }
+'f64.convert_i64_u'   { Lexeme _ (TKeyword "f64.convert_i64_u") }
+'f64.promote_f32'     { Lexeme _ (TKeyword "f64.promote_f32") }
+'i32.reinterpret_f32' { Lexeme _ (TKeyword "i32.reinterpret_f32") }
+'i64.reinterpret_f64' { Lexeme _ (TKeyword "i64.reinterpret_f64") }
+'f32.reinterpret_i32' { Lexeme _ (TKeyword "f32.reinterpret_i32") }
+'f64.reinterpret_i64' { Lexeme _ (TKeyword "f64.reinterpret_i64") }
 'block'               { Lexeme _ (TKeyword "block") }
 'loop'                { Lexeme _ (TKeyword "loop") }
 'if'                  { Lexeme _ (TKeyword "if") }
@@ -310,14 +323,14 @@ import Language.Wasm.Lexer (
 'register'            { Lexeme _ (TKeyword "register") }
 'invoke'              { Lexeme _ (TKeyword "invoke") }
 'get'                 { Lexeme _ (TKeyword "get") }
-'assert_return'       { Lexeme _ (TKeyword "assert_return") }
-'assert_return_canonical_nan' { Lexeme _ (TKeyword "assert_return_canonical_nan") }
-'assert_return_arithmetic_nan' { Lexeme _ (TKeyword "assert_return_arithmetic_nan") }
-'assert_trap'         { Lexeme _ (TKeyword "assert_trap") }
-'assert_malformed'    { Lexeme _ (TKeyword "assert_malformed") }
-'assert_invalid'      { Lexeme _ (TKeyword "assert_invalid") }
-'assert_unlinkable'   { Lexeme _ (TKeyword "assert_unlinkable") }
-'assert_exhaustion'   { Lexeme _ (TKeyword "assert_exhaustion") }
+'assert_return'       { Lexeme $$ (TKeyword "assert_return") }
+'assert_return_canonical_nan' { Lexeme $$ (TKeyword "assert_return_canonical_nan") }
+'assert_return_arithmetic_nan' { Lexeme $$ (TKeyword "assert_return_arithmetic_nan") }
+'assert_trap'         { Lexeme $$ (TKeyword "assert_trap") }
+'assert_malformed'    { Lexeme $$ (TKeyword "assert_malformed") }
+'assert_invalid'      { Lexeme $$ (TKeyword "assert_invalid") }
+'assert_unlinkable'   { Lexeme $$ (TKeyword "assert_unlinkable") }
+'assert_exhaustion'   { Lexeme $$ (TKeyword "assert_exhaustion") }
 'script'              { Lexeme _ (TKeyword "script") }
 'input'               { Lexeme _ (TKeyword "input") }
 'output'              { Lexeme _ (TKeyword "output") }
@@ -389,7 +402,7 @@ float64 :: { Double }
     : int {%
         let maxInt = round (maxFinite :: Double) in
         if $1 <= maxInt && $1 >= -maxInt
-        then return $ fromIntegral $1
+        then doubleFromInteger $1
         else Left "constant out of range"
     }
     | f64 {% asDouble $1 }
@@ -435,8 +448,6 @@ plaininstr :: { PlainInstr }
     | 'i64.store8' memarg1           { I64Store8 $2 }
     | 'i64.store16' memarg2          { I64Store16 $2 }
     | 'i64.store32' memarg4          { I64Store32 $2 }
-    | 'current_memory'               { CurrentMemory }
-    | 'grow_memory'                  { GrowMemory }
     | 'memory.size'                  { CurrentMemory }
     | 'memory.grow'                  { GrowMemory }
     -- numeric instructions
@@ -447,6 +458,8 @@ plaininstr :: { PlainInstr }
     | 'i32.clz'                      { IUnOp BS32 IClz }
     | 'i32.ctz'                      { IUnOp BS32 ICtz }
     | 'i32.popcnt'                   { IUnOp BS32 IPopcnt }
+    | 'i32.extend8_s'                { IUnOp BS32 IExtend8S }
+    | 'i32.extend16_s'               { IUnOp BS32 IExtend16S }
     | 'i32.add'                      { IBinOp BS32 IAdd }
     | 'i32.sub'                      { IBinOp BS32 ISub }
     | 'i32.mul'                      { IBinOp BS32 IMul }
@@ -465,6 +478,9 @@ plaininstr :: { PlainInstr }
     | 'i64.clz'                      { IUnOp BS64 IClz }
     | 'i64.ctz'                      { IUnOp BS64 ICtz }
     | 'i64.popcnt'                   { IUnOp BS64 IPopcnt }
+    | 'i64.extend8_s'                { IUnOp BS64 IExtend8S }
+    | 'i64.extend16_s'               { IUnOp BS64 IExtend16S }
+    | 'i64.extend32_s'               { IUnOp BS64 IExtend32S }
     | 'i64.add'                      { IBinOp BS64 IAdd }
     | 'i64.sub'                      { IBinOp BS64 ISub }
     | 'i64.mul'                      { IBinOp BS64 IMul }
@@ -542,74 +558,92 @@ plaininstr :: { PlainInstr }
     | 'f64.gt'                       { FRelOp BS64 FGt }
     | 'f64.le'                       { FRelOp BS64 FLe }
     | 'f64.ge'                       { FRelOp BS64 FGe }
-    | 'i32.wrap/i64'                 { I32WrapI64 }
-    | 'i32.trunc_s/f32'              { ITruncFS BS32 BS32 }
-    | 'i32.trunc_u/f32'              { ITruncFU BS32 BS32 }
-    | 'i32.trunc_s/f64'              { ITruncFS BS32 BS64 }
-    | 'i32.trunc_u/f64'              { ITruncFU BS32 BS64 }
-    | 'i64.extend_s/i32'             { I64ExtendSI32 }
-    | 'i64.extend_u/i32'             { I64ExtendUI32 }
-    | 'i64.trunc_s/f32'              { ITruncFS BS64 BS32 }
-    | 'i64.trunc_u/f32'              { ITruncFU BS64 BS32 }
-    | 'i64.trunc_s/f64'              { ITruncFS BS64 BS64 }
-    | 'i64.trunc_u/f64'              { ITruncFU BS64 BS64 }
-    | 'f32.convert_s/i32'            { FConvertIS BS32 BS32 }
-    | 'f32.convert_u/i32'            { FConvertIU BS32 BS32 }
-    | 'f32.convert_s/i64'            { FConvertIS BS32 BS64 }
-    | 'f32.convert_u/i64'            { FConvertIU BS32 BS64 }
-    | 'f32.demote/f64'               { F32DemoteF64 }
-    | 'f64.convert_s/i32'            { FConvertIS BS64 BS32 }
-    | 'f64.convert_u/i32'            { FConvertIU BS64 BS32 }
-    | 'f64.convert_s/i64'            { FConvertIS BS64 BS64 }
-    | 'f64.convert_u/i64'            { FConvertIU BS64 BS64 }
-    | 'f64.promote/f32'              { F64PromoteF32 }
-    | 'i32.reinterpret/f32'          { IReinterpretF BS32 }
-    | 'i64.reinterpret/f64'          { IReinterpretF BS64 }
-    | 'f32.reinterpret/i32'          { FReinterpretI BS32 }
-    | 'f64.reinterpret/i64'          { FReinterpretI BS64 }
+    | 'i32.wrap_i64'                 { I32WrapI64 }
+    | 'i32.trunc_f32_s'              { ITruncFS BS32 BS32 }
+    | 'i32.trunc_f32_u'              { ITruncFU BS32 BS32 }
+    | 'i32.trunc_f64_s'              { ITruncFS BS32 BS64 }
+    | 'i32.trunc_f64_u'              { ITruncFU BS32 BS64 }
+    | 'i32.trunc_sat_f32_s'          { ITruncSatFS BS32 BS32 }
+    | 'i32.trunc_sat_f32_u'          { ITruncSatFU BS32 BS32 }
+    | 'i32.trunc_sat_f64_s'          { ITruncSatFS BS32 BS64 }
+    | 'i32.trunc_sat_f64_u'          { ITruncSatFU BS32 BS64 }
+    | 'i64.extend_i32_s'             { I64ExtendSI32 }
+    | 'i64.extend_i32_u'             { I64ExtendUI32 }
+    | 'i64.trunc_f32_s'              { ITruncFS BS64 BS32 }
+    | 'i64.trunc_f32_u'              { ITruncFU BS64 BS32 }
+    | 'i64.trunc_f64_s'              { ITruncFS BS64 BS64 }
+    | 'i64.trunc_f64_u'              { ITruncFU BS64 BS64 }
+    | 'i64.trunc_sat_f32_s'          { ITruncSatFS BS64 BS32 }
+    | 'i64.trunc_sat_f32_u'          { ITruncSatFU BS64 BS32 }
+    | 'i64.trunc_sat_f64_s'          { ITruncSatFS BS64 BS64 }
+    | 'i64.trunc_sat_f64_u'          { ITruncSatFU BS64 BS64 }
+    | 'f32.convert_i32_s'            { FConvertIS BS32 BS32 }
+    | 'f32.convert_i32_u'            { FConvertIU BS32 BS32 }
+    | 'f32.convert_i64_s'            { FConvertIS BS32 BS64 }
+    | 'f32.convert_i64_u'            { FConvertIU BS32 BS64 }
+    | 'f32.demote_f64'               { F32DemoteF64 }
+    | 'f64.convert_i32_s'            { FConvertIS BS64 BS32 }
+    | 'f64.convert_i32_u'            { FConvertIU BS64 BS32 }
+    | 'f64.convert_i64_s'            { FConvertIS BS64 BS64 }
+    | 'f64.convert_i64_u'            { FConvertIU BS64 BS64 }
+    | 'f64.promote_f32'              { F64PromoteF32 }
+    | 'i32.reinterpret_f32'          { IReinterpretF BS32 }
+    | 'i64.reinterpret_f64'          { IReinterpretF BS64 }
+    | 'f32.reinterpret_i32'          { FReinterpretI BS32 }
+    | 'f64.reinterpret_i64'          { FReinterpretI BS64 }
 
-typeuse :: { TypeUse }
-    : '(' typeuse1 { $2 }
-    | {- empty -} { AnonimousTypeUse $ FuncType [] [] }
+typeuse(next)
+    : '(' typeuse1(folded_instr_list(next), instruction_list(next)) {
+        let (tu, rest) = $2 in
+        let (next, instr) = either id id rest in
+        (tu, instr, next)
+    }
+    | instruction_list(next) { let (next, instr) = $1 in (emptyTypeUse, instr, next) }
 
-typeuse1 :: { TypeUse }
-    : 'type' index ')' typedtypeuse { IndexedTypeUse $2 $4 }
-    | paramsresultstypeuse { AnonimousTypeUse $1 }
+typeuse1(close, next)
+    : 'type' index ')' typesign(close, next) {
+        case $4 of
+            (FuncType [] [], rest) -> (IndexedTypeUse $2 Nothing, rest)
+            (ft, rest) -> (IndexedTypeUse $2 (Just ft), rest)
+    }
+    | typesign1(close, next) {
+        let (fnType, rest) = $1 in
+        (AnonimousTypeUse fnType, rest)
+    }
 
-typedtypeuse :: { Maybe FuncType }
-    : '(' paramsresultstypeuse { Just $2 }
-    | {- empty -} { Nothing }
+typesign(close, next)
+    : '(' typesign1(close, next) { $2 }
+    | next { (emptyFuncType, Left $1) }
+
+typesign1(close, next)
+    : 'param' list(valtype) ')' typesign(close, next) {
+        let (ft, rest) = $4 in
+        (mergeFuncType (FuncType (map (ParamType Nothing) $2) []) ft, rest)
+    }
+    | 'param' ident valtype ')' typesign(close, next) {
+         let (ft, rest) = $5 in
+        (mergeFuncType (FuncType [ParamType (Just $2) $3] []) ft, rest)
+    }
+    | typesign_result1(close, next) { $1 }
+
+typesign_result(close, next)
+    : '(' typesign_result1(close, next) { $2 }
+    | next { (emptyFuncType, Left $1) }
+
+typesign_result1(close, next)
+    : 'result' list(valtype) ')' typesign_result(close, next) {
+        let (ft, rest) = $4 in
+        (mergeFuncType (FuncType [] $2) ft, rest)
+    }
+    | close { (emptyFuncType, Right $1) }
+
+never : EOF { () }
 
 typedef :: { TypeDef }
     : 'type' opt(ident) functype ')' { TypeDef $2 $3 }
 
 functype :: { FuncType }
-    : '(' 'func' params_results { $3 }
-
-params_results :: { FuncType }
-    : ')' { emptyFuncType }
-    | '(' params_results1 { $2 }
-
-params_results1 :: { FuncType }
-    : 'param' list(valtype) ')' params_results { mergeFuncType (FuncType (map (ParamType Nothing) $2) []) $4 }
-    | 'param' ident valtype ')' params_results { mergeFuncType (FuncType [ParamType (Just $2) $3] []) $5 }
-    | results1 { $1 }
-
-results :: { FuncType }
-    : ')' { emptyFuncType }
-    | '(' results1 { $2 }
-
-results1 :: { FuncType }
-    : 'result' list(valtype) ')' results { mergeFuncType (FuncType [] $2) $4 }
-
-paramsresultstypeuse :: { FuncType }
-    : paramsresultstypeuse '(' paramsresulttypeuse { mergeFuncType $1 $3 }
-    | paramsresulttypeuse { $1 }
-
-paramsresulttypeuse :: { FuncType }
-    : 'param' list(valtype) ')' { FuncType (map (ParamType Nothing) $2) [] }
-    | 'param' ident valtype ')' { FuncType [ParamType (Just $2) $3] [] }
-    | 'result' list(valtype) ')' { FuncType [] $2 }
+    : '(' 'func' typesign(')', ')')  { let (ft, _) = $3 in ft }
 
 memarg1 :: { MemArg }
     : opt(offset) opt(align) {% parseMemArg 1 $1 $2 }
@@ -623,188 +657,68 @@ memarg4 :: { MemArg }
 memarg8 :: { MemArg }
     : opt(offset) opt(align) {% parseMemArg 8 $1 $2 }
 
-instruction :: { [Instruction] }
-    : raw_instr { $1 }
-    | folded_instr { $1 }
-
-raw_instr :: { [Instruction] }
-    : plaininstr { [PlainInstr $1] }
-    | 'call_indirect' raw_call_indirect { $2 }
-    | 'block' opt(ident) raw_block {% (: []) `fmap` $3 $2 }
-    | 'loop' opt(ident) raw_loop {% (: []) `fmap` $3 $2 }
-    | 'if' opt(ident) raw_if_result {% $3 $2 }
-
-raw_block :: { Maybe Ident -> Either String Instruction }
-    : 'end' opt(ident) {
-        \ident ->
-            if ident == $2 || isNothing $2
-            then Right $ BlockInstr ident [] []
-            else Left "Block labels have to match"
+instruction_list(terminator)
+    : terminator { ($1, []) }
+    | plaininstr mixed_instruction_list(terminator) { ([PlainInstr $1] ++) `fmap` $2 }
+    | 'call_indirect' typeuse(terminator) {%
+        let (tu, instr, end) = $2 in
+        onlyAnonimParams tu >> (return (end, [PlainInstr $ CallIndirect tu] ++ instr))
     }
-    | raw_instr list(instruction) 'end' opt(ident) {
-        \ident ->
-            if ident == $4 || isNothing $4
-            then Right $ BlockInstr ident [] ($1 ++ concat $2)
-            else Left "Block labels have to match"
+    | 'block' opt(ident) typeuse('end') opt(ident) mixed_instruction_list(terminator) {% do
+        let (tu, instr, _) = $3 
+        matchIdents $2 $4
+        onlyAnonimParams tu
+        return $ ([BlockInstr $2 tu instr] ++) `fmap` $5
     }
-    | '(' raw_block1 { $2 }
-
-raw_block1 :: { Maybe Ident -> Either String Instruction }
-    : 'result' valtype ')' list(instruction) 'end' opt(ident) {
-        \ident ->
-            if ident == $6 || isNothing $6
-            then Right $ BlockInstr ident [$2] (concat $4)
-            else Left "Block labels have to match"
+    | 'loop' opt(ident) typeuse('end') opt(ident) mixed_instruction_list(terminator) {% do
+        let (tu, instr, _) = $3
+        matchIdents $2 $4
+        onlyAnonimParams tu
+        return $ ([LoopInstr $2 tu instr] ++) `fmap` $5
     }
-    | folded_instr1 list(instruction) 'end' opt(ident) {
-        \ident ->
-            if ident == $4 || isNothing $4
-            then Right $ BlockInstr ident [] ($1 ++ concat $2)
-            else Left "Block labels have to match"
+    | 'if' opt(ident) typeuse(if_else) mixed_instruction_list(terminator) {% do
+        let (tu, trueBranch, (falseBranch, identAfter)) = $3
+        matchIdents $2 identAfter
+        onlyAnonimParams tu
+        return $ ([IfInstr $2 tu trueBranch falseBranch] ++) `fmap` $4
     }
 
-raw_loop :: { Maybe Ident -> Either String Instruction }
-    : 'end' opt(ident) {
-        \ident ->
-            if ident == $2 || isNothing $2
-            then Right $ LoopInstr ident [] []
-            else Left "Loop labels have to match"
-    }
-    | raw_instr list(instruction) 'end' opt(ident) {
-        \ident ->
-            if ident == $4 || isNothing $4
-            then Right $ LoopInstr ident [] ($1 ++ concat $2)
-            else Left "Loop labels have to match"
-    }
-    | '(' raw_loop1 { $2 }
+mixed_instruction_list(terminator)
+    : '(' folded_instr1 mixed_instruction_list(terminator) { ($2 ++) `fmap` $3 }
+    | instruction_list(terminator) { $1 }
 
-raw_loop1 :: { Maybe Ident -> Either String Instruction }
-    : 'result' valtype ')' list(instruction) 'end' opt(ident) {
-        \ident ->
-            if ident == $6 || isNothing $6
-            then Right $ LoopInstr ident [$2] (concat $4)
-            else Left "Loop labels have to match"
-    }
-    | folded_instr1 list(instruction) 'end' opt(ident) {
-        \ident ->
-            if ident == $4 || isNothing $4
-            then Right $ LoopInstr ident [] ($1 ++ concat $2)
-            else Left "Loop labels have to match"
-    }
-
-raw_if_result :: { Maybe Ident -> Either String [Instruction] }
-    : raw_else {
-        \ident ->
-            if ident == (snd $1) || isNothing (snd $1)
-            then Right [IfInstr ident [] [] $ fst $1]
-            else Left "If labels have to match"
-    }
-    | raw_instr list(instruction) raw_else {
-        \ident ->
-            if ident == (snd $3) || isNothing (snd $3)
-            then Right [IfInstr ident [] ($1 ++ concat $2) $ fst $3]
-            else Left "If labels have to match"
-    }
-    | '(' raw_if_result1 { $2 }
-
-raw_if_result1 :: { Maybe Ident -> Either String [Instruction] }
-    : 'result' valtype ')' list(instruction) raw_else {
-        \ident ->
-            if ident == (snd $5) || isNothing (snd $5)
-            then Right [IfInstr ident [$2] (concat $4) $ fst $5]
-            else Left "If labels have to match"
-    }
-    | folded_instr1 list(instruction) raw_else {
-        \ident ->
-            if ident == (snd $3) || isNothing (snd $3)
-            then Right [IfInstr ident [] ($1 ++ concat $2) $ fst $3]
-            else Left "If labels have to match"
-    }
-
-raw_else :: { ([Instruction], Maybe Ident) }
+if_else :: { ([Instruction], Maybe Ident) }
     : 'end' opt(ident) { ([], $2) }
-    | 'else' opt(ident) list(instruction) 'end' opt(ident) {%
-        if matchIdents $2 $5
-        then Right (concat $3, if isNothing $2 then $5 else $2)
-        else Left "If labels have to match"
+    | 'else' opt(ident) mixed_instruction_list('end') opt(ident) {%
+        matchIdents $2 $4 >> return (snd $3, if isNothing $2 then $4 else $2)
     }
 
-raw_call_indirect :: { [Instruction] }
-    : '(' raw_call_indirect_typeuse { (PlainInstr $ CallIndirect $ fst $2) : snd $2 }
-    | {- empty -} { [PlainInstr $ CallIndirect $ AnonimousTypeUse $ FuncType [] []] }
-
-raw_call_indirect_typeuse :: { (TypeUse, [Instruction]) }
-    : 'type' index ')' raw_call_indirect_functype {
-        (IndexedTypeUse $2 $ fst $4, snd $4)
-    }
-    | raw_call_indirect_functype1 {
-        (AnonimousTypeUse $ fromMaybe (FuncType [] []) $ fst $1, snd $1)
-    }
-
-raw_call_indirect_functype :: { (Maybe FuncType, [Instruction]) }
-    : '(' raw_call_indirect_functype1 { $2 }
-    | {- empty -} { (Nothing, []) }
-
-raw_call_indirect_functype1 :: { (Maybe FuncType, [Instruction]) }
-    : 'param' list(valtype) ')' raw_call_indirect_functype {
-        let ft = fromMaybe emptyFuncType $ fst $4 in
-        (Just $ ft { params = map (ParamType Nothing) $2 ++ params ft }, snd $4)
-    }
-    | raw_call_indirect_return_functype1 { $1 }
-
-raw_call_indirect_return_functype :: { (Maybe FuncType, [Instruction]) }
-    : '(' raw_call_indirect_return_functype1 { $2 }
-    | {- empty -} { (Nothing, []) }
-
-raw_call_indirect_return_functype1 :: { (Maybe FuncType, [Instruction]) }
-    : 'result' list(valtype) ')' raw_call_indirect_return_functype {
-        let ft = fromMaybe emptyFuncType $ fst $4 in
-        (Just $ ft { results = $2 ++ results ft }, snd $4)
-    }
-    | folded_instr1 { (Nothing, $1) }
+folded_instr_list(terminator) : folded_instr1 mixed_instruction_list(terminator) { ($1 ++) `fmap` $2 }
 
 folded_instr :: { [Instruction] }
     : '(' folded_instr1 { $2 }
 
 folded_instr1 :: { [Instruction] }
-    : plaininstr list(folded_instr) ')' { concat $2 ++ [PlainInstr $1] }
-    | 'call_indirect' folded_call_indirect { $2 }
-    | 'block' opt(ident) folded_block { [$3 $2] }
-    | 'loop' opt(ident) folded_loop { [$3 $2] }
-    | 'if' opt(ident) '(' folded_if_result { $4 $2 }
-
-folded_block :: { Maybe Ident -> Instruction }
-    : ')' { \ident -> BlockInstr ident [] [] }
-    | '(' folded_block1 { $2 }
-    | raw_instr list(instruction) ')' { \ident -> BlockInstr ident [] ($1 ++ concat $2) }
-
-folded_block1 :: { Maybe Ident -> Instruction }
-    : 'result' valtype ')' list(instruction) ')' { \ident -> BlockInstr ident [$2] (concat $4) }
-    | folded_instr1 list(instruction) ')' { \ident -> BlockInstr ident [] ($1 ++ concat $2) }
-
-folded_loop :: { Maybe Ident -> Instruction }
-    : ')' { \ident -> LoopInstr ident [] [] }
-    | '(' folded_loop1 { $2 }
-    | raw_instr list(instruction) ')' { \ident -> LoopInstr ident [] ($1 ++ concat $2) }
-
-folded_loop1 :: { Maybe Ident -> Instruction }
-    : 'result' valtype ')' list(instruction) ')' { \ident -> LoopInstr ident [$2] (concat $4) }
-    | folded_instr1 list(instruction) ')' { \ident -> LoopInstr ident [] ($1 ++ concat $2) }
-
-folded_if_result :: { Maybe Ident -> [Instruction] }
-    : 'result' valtype ')' '(' folded_then_else {
-        \ident ->
-            let (pred, (trueBranch, falseBranch)) = $5 in
-            pred ++ [IfInstr ident [$2] trueBranch falseBranch]
+    : plaininstr mixed_instruction_list(')') { snd $2 ++ [PlainInstr $1] }
+    | 'call_indirect' typeuse(')') {%
+        let (tu, instr, _) = $2 in
+        onlyAnonimParams tu >> (return $ instr ++ [PlainInstr $ CallIndirect tu])
     }
-    | folded_then_else {
-        \ident ->
-            let (pred, (trueBranch, falseBranch)) = $1 in
-            pred ++ [IfInstr ident [] trueBranch falseBranch]
+    | 'block' opt(ident) typeuse(')') {%
+        let (typeUse, instr, _) = $3 in
+        onlyAnonimParams typeUse >> (return [BlockInstr $2 typeUse instr])
+    }
+    | 'loop' opt(ident) typeuse(')') {%
+        let (typeUse, instr, _) = $3 in
+        onlyAnonimParams typeUse >> (return [LoopInstr $2 typeUse instr])
+    }
+    | 'if' opt(ident) '(' typeuse1(folded_then_else, never) {%
+        let (typeUse, Right (pred, (trueBranch, falseBranch))) = $4 in
+        onlyAnonimParams typeUse >> (return $ pred ++ [IfInstr $2 typeUse trueBranch falseBranch])
     }
 
 folded_then_else :: { ([Instruction], ([Instruction], [Instruction])) }
-    : 'then' list(instruction) ')' folded_else { ([], (concat $2, $4)) }
+    : 'then' mixed_instruction_list(')') folded_else { ([], (snd $2, $3)) }
     | folded_instr1 '(' folded_then_else {
         let (pred, branches) = $3 in
         ($1 ++ pred, branches)
@@ -812,44 +726,12 @@ folded_then_else :: { ([Instruction], ([Instruction], [Instruction])) }
 
 folded_else :: { [Instruction] }
     : ')' { [] }
-    | '(' 'else' list(instruction) ')' ')' { concat $3 }
-
-folded_call_indirect :: { [Instruction] }
-    : ')' { [PlainInstr $ CallIndirect $ AnonimousTypeUse $ FuncType [] []] }
-    | '(' folded_call_indirect_typeuse { snd $2 ++ [PlainInstr $ CallIndirect $ fst $2] }
-
-folded_call_indirect_typeuse :: { (TypeUse, [Instruction]) }
-    : 'type' index ')' folded_call_indirect_functype {
-        (IndexedTypeUse $2 $ fst $4, snd $4)
-    }
-    | folded_call_indirect_functype1 {
-        (AnonimousTypeUse $ fromMaybe (FuncType [] []) $ fst $1, snd $1)
-    }
-
-folded_call_indirect_functype :: { (Maybe FuncType, [Instruction]) }
-    : '(' folded_call_indirect_functype1 { $2 }
-    | ')' { (Nothing, []) }
-
-folded_call_indirect_functype1 :: { (Maybe FuncType, [Instruction]) }
-    : 'param' list(valtype) ')' folded_call_indirect_functype {
-        let ft = fromMaybe emptyFuncType $ fst $4 in
-        (Just $ ft { params = map (ParamType Nothing) $2 ++ params ft }, snd $4)
-    }
-    | folded_call_indirect_return_functype1 { $1 }
-
-folded_call_indirect_return_functype :: { (Maybe FuncType, [Instruction]) }
-    : '(' folded_call_indirect_return_functype1 { $2 }
-    | ')' { (Nothing, []) }
-
-folded_call_indirect_return_functype1 :: { (Maybe FuncType, [Instruction]) }
-    : 'result' list(valtype) ')' folded_call_indirect_return_functype {
-        let ft = fromMaybe emptyFuncType $ fst $4 in
-        (Just $ ft { results = $2 ++ results ft }, snd $4)
-    }
-    | folded_instr1 list(folded_instr) ')' { (Nothing, $1 ++ concat $2) }
+    | '(' 'else' mixed_instruction_list(')') ')' { snd $3 }
 
 importdesc :: { ImportDesc }
-    : 'func' opt(ident) typeuse ')' { ImportFunc $2 $3 }
+    : 'func' opt(ident) typeuse(')') {
+        let (ft, _, _) = $3 in ImportFunc $2 ft
+    }
     | 'table' opt(ident) tabletype ')' { ImportTable $2 $3 }
     | 'memory' opt(ident) limits ')' { ImportMemory $2 $3 }
     | 'global' opt(ident) globaltype ')' { ImportGlobal $2 $3 }
@@ -859,12 +741,15 @@ import :: { Import }
 
 -- FUNCTION --
 function :: { ModuleField }
-    : 'func' opt(ident) export_import_typeuse_locals_body { $3 $2 }
+    : 'func' opt(ident) export_import_typeuse_locals_body {%
+        case $3 $2 of
+            mf@(MFFunc fn) -> checkLocalIdentUniqueness fn >> return mf
+            mf -> return mf
+    }
 
 export_import_typeuse_locals_body :: { Maybe Ident -> ModuleField }
-    : ')' { \i -> MFFunc emptyFunction { ident = i } }
-    | raw_instr list(instruction) ')' {
-        \i -> MFFunc emptyFunction { ident = i, body = $1 ++ concat $2 }
+    : instruction_list(')') {
+        \i -> MFFunc emptyFunction { ident = i, body = snd $1 }
     }
     | '(' export_import_typeuse_locals_body1 { $2 }
 
@@ -879,55 +764,24 @@ export_import_typeuse_locals_body1 :: { Maybe Ident -> ModuleField }
     | import_typeuse_locals_body1 { $1 }
 
 import_typeuse_locals_body1 :: { Maybe Ident -> ModuleField }
-    : 'import' name name ')' typeuse ')' {
-        \ident -> MFImport $ Import [] $2 $3 $ ImportFunc ident $5
+    : 'import' name name ')' typeuse(')') {
+        let (ft, _, _) = $5 in
+        \ident -> MFImport $ Import [] $2 $3 $ ImportFunc ident ft
     }
-    | typeuse_locals_body1 { MFFunc . $1 }
-
-typeuse_locals_body1 :: { Maybe Ident -> Function }
-    : 'type' index ')' signature_locals_body {
-        \i ->
-            let (AnonimousTypeUse signature) = funcType $4 in
-            let typeSign = if signature == emptyFuncType then Nothing else Just signature in
-            $4 { funcType = IndexedTypeUse $2 typeSign, ident = i }
-    }
-    | signature_locals_body1 { \i -> $1 { ident = i } }
-
-signature_locals_body :: { Function }
-    : ')' { emptyFunction }
-    | '(' signature_locals_body1 { $2 }
-
-signature_locals_body1 :: { Function }
-    : 'param' list(valtype) ')' signature_locals_body {
-        prependFuncParams (map (ParamType Nothing) $2) $4
-    }
-    | 'param' ident valtype ')' signature_locals_body {
-        prependFuncParams [ParamType (Just $2) $3] $5
-    }
-    | result_locals_body1 { $1 }
-
-result_locals_body :: { Function }
-    : ')' { emptyFunction }
-    | '(' result_locals_body1 { $2 }
-    | raw_instr list(instruction) ')' { emptyFunction { body = $1 ++ concat $2 } }
-
-result_locals_body1 :: { Function }
-    : 'result' list(valtype) ')' result_locals_body {
-        prependFuncResults $2 $4
-    }
-    | locals_body1 {
-        emptyFunction { locals = fst $1, body = snd $1 }
+    | typeuse1(func_mid1, instruction_list(')')) {
+        let (funcType, rest) = $1 in
+        let (locals, body) = either (\a -> ([], snd a)) id rest in
+        \ident -> MFFunc $ emptyFunction { locals, body, ident, funcType }
     }
 
-locals_body :: { ([LocalType], [Instruction]) }
-    : ')' { ([], []) }
-    | raw_instr list(instruction) ')' { ([], $1 ++ concat $2)}
-    | '(' locals_body1 { $2 }
+func_mid :: { ([LocalType], [Instruction]) }
+    : instruction_list(')') { ([], snd $1) }
+    | '(' func_mid1 { $2 }
 
-locals_body1 :: { ([LocalType], [Instruction]) }
-    : 'local' list(valtype) ')' locals_body { (map (LocalType Nothing) $2 ++ fst $4, snd $4) }
-    | 'local' ident valtype ')' locals_body { (LocalType (Just $2) $3 : fst $5, snd $5) }
-    | folded_instr1 list(instruction) ')' { ([], $1 ++ concat $2) }
+func_mid1 :: { ([LocalType], [Instruction]) }
+    : 'local' list(valtype) ')' func_mid { (map (LocalType Nothing) $2 ++ fst $4, snd $4) }
+    | 'local' ident valtype ')' func_mid { (LocalType (Just $2) $3 : fst $5, snd $5) }
+    | folded_instr_list(')') { ([], snd $1) }
 
 -- FUNCTION END --
 
@@ -941,11 +795,11 @@ globaltype :: { GlobalType }
     | '(' 'mut' valtype ')' { Mut $3 }
 
 global_type_export_import :: { Maybe Ident -> ModuleField }
-    : valtype list(instruction) ')' { \ident -> MFGlobal $ Global [] ident (Const $1) $ concat $2 }
+    : valtype mixed_instruction_list(')') { \ident -> MFGlobal $ Global [] ident (Const $1) $ snd $2 }
     | '(' global_mut_export_import { $2 }
 
 global_mut_export_import :: { Maybe Ident -> ModuleField }
-    : 'mut' valtype ')' list(instruction) ')' { \ident -> MFGlobal $ Global [] ident (Mut $2) $ concat $4 }
+    : 'mut' valtype ')' mixed_instruction_list(')') { \ident -> MFGlobal $ Global [] ident (Mut $2) $ snd $4 }
     | 'export' name ')' global_type_export_import {
         \ident ->
             case $4 ident of
@@ -1001,7 +855,7 @@ limits :: { Limit }
     : u32 opt(u32) { Limit (fromIntegral $1) (fromIntegral `fmap` $2) }
 
 elemtype :: { ElemType }
-    : 'anyfunc' { AnyFunc }
+    : 'funcref' { FuncRef }
 
 tabletype :: { TableType }
     : limits elemtype { TableType $1 $2 }
@@ -1050,7 +904,7 @@ start :: { StartFunction }
 -- but collection of testcases omits 'offset' in this position
 -- I am going to support both options for now, but maybe it has to be updated in future.
 offsetexpr :: { [Instruction] }
-    : 'offset' list(folded_instr) ')' { concat $2 }
+    : 'offset' mixed_instruction_list(')') { snd $2 }
     | folded_instr1 { $1 }
 
 elemsegment :: { ElemSegment }
@@ -1089,7 +943,10 @@ mod :: { S.Module }
 
 -- Wasm Script Extended Grammar
 script :: { Script }
-    : list(command) EOF { $1 }
+    : '(' command1 list(command) EOF { $2 : $3 }
+    | '(' modulefield1 list(modulefield) EOF {%
+        (\m -> [ModuleDef $ RawModDef Nothing m]) `fmap` (desugarize $ $2 ++ concat $3)
+    }
 
 command :: { Command }
     : '(' command1 { $2 }
@@ -1098,28 +955,27 @@ command1 :: { Command }
     : module1 { ModuleDef $1 }
     | 'register' string opt(ident) ')' { Register $2 $3 }
     | action1 { Action $1 }
-    | assertion1 { Assertion $1 }
+    | assertion1 { let (Just (AlexPn _ line _), a) = $1 in Assertion line a }
     | meta1 { Meta $1 }
 
 module1 :: { ModuleDef }
     : 'module' opt(ident) 'binary' datastring ')' { BinaryModDef $2 $4 }
     | 'module' opt(ident) 'quote' list(string) ')' { TextModDef $2 (TL.concat $4) }
     | 'module' opt(ident) list(modulefield) ')' {% RawModDef $2 `fmap` (desugarize $ concat $3) }
-    | modulefield1 list(modulefield) {% RawModDef Nothing `fmap` (desugarize $ $1 ++ concat $2) }
 
 action1 :: { Action }
     : 'invoke' opt(ident) string list(folded_instr) ')' { Invoke $2 $3 (map (map constInstructionToValue) $4) }
     | 'get' opt(ident) string ')' { Get $2 $3 }
 
-assertion1 :: { Assertion }
-    : 'assert_return' '(' action1 list(folded_instr) ')' { AssertReturn $3 (map (map constInstructionToValue) $4) }
-    | 'assert_return_canonical_nan' '(' action1 ')' { AssertReturnCanonicalNaN $3 }
-    | 'assert_return_arithmetic_nan' '(' action1 ')' { AssertReturnArithmeticNaN $3 }
-    | 'assert_trap' '(' assertion_trap string ')' { AssertTrap $3 $4 }
-    | 'assert_malformed' '(' module1 string ')' { AssertMalformed $3 $4 }
-    | 'assert_invalid' '(' module1 string ')' { AssertInvalid $3 $4 }
-    | 'assert_unlinkable' '(' module1 string ')' { AssertUnlinkable $3 $4 }
-    | 'assert_exhaustion' '(' action1 string ')' { AssertExhaustion $3 $4 }
+assertion1 :: { (Maybe AlexPosn, Assertion) }
+    : 'assert_return' '(' action1 list(folded_instr) ')' { ($1, AssertReturn $3 (map (map constInstructionToValue) $4)) }
+    | 'assert_return_canonical_nan' '(' action1 ')' { ($1, AssertReturnCanonicalNaN $3) }
+    | 'assert_return_arithmetic_nan' '(' action1 ')' { ($1, AssertReturnArithmeticNaN $3) }
+    | 'assert_trap' '(' assertion_trap string ')' { ($1, AssertTrap $3 $4) }
+    | 'assert_malformed' '(' module1 string ')' { ($1, AssertMalformed $3 $4) }
+    | 'assert_invalid' '(' module1 string ')' { ($1, AssertInvalid $3 $4) }
+    | 'assert_unlinkable' '(' module1 string ')' { ($1, AssertUnlinkable $3 $4) }
+    | 'assert_exhaustion' '(' action1 string ')' { ($1, AssertExhaustion $3 $4) }
 
 assertion_trap :: { Either Action ModuleDef }
     : action1 { Left $1 }
@@ -1161,10 +1017,36 @@ prependFuncResults prep f@(Function { funcType = AnonimousTypeUse ft }) =
 mergeFuncType :: FuncType -> FuncType -> FuncType
 mergeFuncType (FuncType lps lrs) (FuncType rps rrs) = FuncType (lps ++ rps) (lrs ++ rrs)
 
-matchIdents :: Maybe Ident -> Maybe Ident -> Bool
-matchIdents Nothing _ = True
-matchIdents _ Nothing = True
-matchIdents a b = a == b
+matchIdents :: Maybe Ident -> Maybe Ident -> Either String ()
+matchIdents Nothing Nothing = return ()
+matchIdents (Just a) (Just b) = if a == b then return () else throwError "mismatching label"
+matchIdents Nothing (Just _) = throwError "mismatching label"
+matchIdents (Just _) Nothing = return ()
+
+onlyAnonimParams :: TypeUse -> Either String ()
+onlyAnonimParams (IndexedTypeUse _ (Just ft)) = onlyAnonimFT ft
+onlyAnonimParams (AnonimousTypeUse ft) = onlyAnonimFT ft
+onlyAnonimParams _ = return ()
+
+onlyAnonimFT :: FuncType -> Either String ()
+onlyAnonimFT (FuncType params _) = mapM_ isAnonim params
+    where
+        isAnonim ParamType{ ident = Just _ } =
+            throwError "only anonimous params allowed in block signatures"
+        isAnonim _ = return ()
+
+checkLocalIdentUniqueness :: Function -> Either String Function
+checkLocalIdentUniqueness fn@Function { funcType, locals } =
+    let ps = case funcType of
+            (AnonimousTypeUse ft) -> params ft
+            IndexedTypeUse _ ft -> params $ fromMaybe emptyFuncType ft
+    in
+    let allIdents = (catMaybes $ map (\(LocalType { ident }) -> ident) locals)
+            ++ (catMaybes $ map (\(ParamType { ident }) -> ident) ps)
+    in
+    if nub allIdents == allIdents
+    then return fn
+    else throwError "duplicate local"
 
 asOffset :: LBS.ByteString -> Maybe Natural
 asOffset str = do
@@ -1285,6 +1167,8 @@ data PlainInstr =
     | I32WrapI64
     | ITruncFU {- Int Size -} BitSize {- Float Size -} BitSize
     | ITruncFS {- Int Size -} BitSize {- Float Size -} BitSize
+    | ITruncSatFU {- Int Size -} BitSize {- Float Size -} BitSize
+    | ITruncSatFS {- Int Size -} BitSize {- Float Size -} BitSize
     | I64ExtendSI32
     | I64ExtendUI32
     | FConvertIU {- Float Size -} BitSize {- Int Size -} BitSize
@@ -1302,21 +1186,23 @@ data TypeUse =
     | AnonimousTypeUse FuncType
     deriving (Show, Eq, Generic, NFData)
 
+emptyTypeUse = AnonimousTypeUse emptyFuncType
+
 data Instruction =
     PlainInstr PlainInstr
     | BlockInstr {
         label :: Maybe Ident,
-        resultType :: [ValueType],
+        blockType :: TypeUse,
         body :: [Instruction]
     }
     | LoopInstr {
         label :: Maybe Ident,
-        resultType :: [ValueType],
+        blockType :: TypeUse,
         body :: [Instruction]
     }
     | IfInstr {
         label :: Maybe Ident,
-        resultType :: [ValueType],
+        blockType :: TypeUse,
         trueBranch :: [Instruction],
         falseBranch :: [Instruction]
     }
@@ -1448,7 +1334,7 @@ data Command
     = ModuleDef ModuleDef
     | Register TL.Text (Maybe Ident)
     | Action Action
-    | Assertion Assertion
+    | Assertion Int Assertion
     | Meta Meta
     deriving (Show, Eq)
 
@@ -1495,6 +1381,7 @@ constInstructionToValue _ = error "Only const instructions supported as argument
 desugarize :: [ModuleField] -> Either String S.Module
 desugarize fields = do
     checkImportsOrder fields
+    checkStartCount fields
     let mod = Module {
         types = reverse $ foldl' extractTypeDef (reverse $ explicitTypeDefs fields) fields,
         functions = extract extractFunction fields,
@@ -1511,6 +1398,10 @@ desugarize fields = do
     elements <- mapM (synElemToStruct mod) $ elems mod
     segments <- mapM (synDataToStruct mod) $ datas mod
     globs <- mapM (synGlobalToStruct mod) $ globals mod
+    checkFuncIdentsUniqueness mod
+    checkTableIdentsUniqueness mod
+    checkMemoryIdentsUniqueness mod
+    checkGlobalIdentsUniqueness mod
     return S.Module {
         S.types = map synTypeDefToStruct $ types mod,
         S.functions = funs,
@@ -1554,6 +1445,15 @@ desugarize fields = do
                 checkDef _ (MFMem _) = return True
                 checkDef _ (MFTable _) = return True
                 checkDef nonImportOccured _ = return nonImportOccured
+        
+        checkStartCount :: [ModuleField] -> Either String ()
+        checkStartCount fields = foldM checkDef False fields >> return ()
+            where
+                checkDef startOccured (MFStart _) =
+                    if startOccured
+                    then Left "Multiple start sections"
+                    else Right True
+                checkDef startOccured _ = return startOccured
 
         extractTypeDef :: [TypeDef] -> ModuleField -> [TypeDef]
         extractTypeDef defs (MFType _) = defs -- should be extracted before implicit defs
@@ -1575,12 +1475,12 @@ desugarize fields = do
         extractTypeDefFromInstruction :: [TypeDef] -> Instruction -> [TypeDef]
         extractTypeDefFromInstruction defs (PlainInstr (CallIndirect typeUse)) =
             matchTypeUse defs typeUse
-        extractTypeDefFromInstruction defs (BlockInstr { body }) =
-            extractTypeDefFromInstructions defs body
-        extractTypeDefFromInstruction defs (LoopInstr { body }) =
-            extractTypeDefFromInstructions defs body
-        extractTypeDefFromInstruction defs (IfInstr { trueBranch, falseBranch }) =
-            extractTypeDefFromInstructions defs $ trueBranch ++ falseBranch
+        extractTypeDefFromInstruction defs (BlockInstr { body, blockType }) =
+            extractTypeDefFromInstructions (matchTypeUse defs blockType) body
+        extractTypeDefFromInstruction defs (LoopInstr { body, blockType }) =
+            extractTypeDefFromInstructions (matchTypeUse defs blockType) body
+        extractTypeDefFromInstruction defs (IfInstr { blockType, trueBranch, falseBranch }) =
+            extractTypeDefFromInstructions (matchTypeUse defs blockType) $ trueBranch ++ falseBranch
         extractTypeDefFromInstruction defs _ = defs
 
         funcTypesEq :: FuncType -> FuncType -> Bool
@@ -1598,6 +1498,11 @@ desugarize fields = do
             else (TypeDef Nothing funcType) : defs
         matchTypeUse defs _ = defs
 
+        nth :: Natural -> [a] -> Maybe a
+        nth 0 (x : xs) = Just x
+        nth n (_ : xs) = nth (n - 1) xs
+        nth _ _ = Nothing
+
         getTypeIndex :: [TypeDef] -> TypeUse -> Maybe Natural
         getTypeIndex defs (AnonimousTypeUse funcType) =
             fromIntegral <$> findIndex (matchTypeFunc funcType) defs
@@ -1608,7 +1513,8 @@ desugarize fields = do
         getTypeIndex defs (IndexedTypeUse (Named ident) Nothing) =
             fromIntegral <$> findIndex (\(TypeDef i _) -> i == Just ident) defs
         getTypeIndex defs (IndexedTypeUse (Index n) (Just funcType)) = do
-            guard $ matchTypeFunc funcType $ defs !! fromIntegral n
+            def <- nth n defs
+            guard $ matchTypeFunc funcType def
             return n
         getTypeIndex defs (IndexedTypeUse (Index n) Nothing) = return n
         
@@ -1716,6 +1622,8 @@ desugarize fields = do
         synInstrToStruct _ (PlainInstr I32WrapI64) = return $ S.I32WrapI64
         synInstrToStruct _ (PlainInstr (ITruncFU sz sz')) = return $ S.ITruncFU sz sz'
         synInstrToStruct _ (PlainInstr (ITruncFS sz sz')) = return $ S.ITruncFS sz sz'
+        synInstrToStruct _ (PlainInstr (ITruncSatFU sz sz')) = return $ S.ITruncSatFU sz sz'
+        synInstrToStruct _ (PlainInstr (ITruncSatFS sz sz')) = return $ S.ITruncSatFS sz sz'
         synInstrToStruct _ (PlainInstr I64ExtendSI32) = return $ S.I64ExtendSI32
         synInstrToStruct _ (PlainInstr I64ExtendUI32) = return $ S.I64ExtendUI32
         synInstrToStruct _ (PlainInstr (FConvertIU sz sz')) = return $ S.FConvertIU sz sz'
@@ -1724,17 +1632,35 @@ desugarize fields = do
         synInstrToStruct _ (PlainInstr F64PromoteF32) = return $ S.F64PromoteF32
         synInstrToStruct _ (PlainInstr (IReinterpretF sz)) = return $ S.IReinterpretF sz
         synInstrToStruct _ (PlainInstr (FReinterpretI sz)) = return $ S.FReinterpretI sz
-        synInstrToStruct ctx BlockInstr {label, resultType, body} =
-            let ctx' = ctx { ctxLabels = label : ctxLabels ctx } in
-            S.Block resultType <$> mapM (synInstrToStruct ctx') body
-        synInstrToStruct ctx LoopInstr {label, resultType, body} =
-            let ctx' = ctx { ctxLabels = label : ctxLabels ctx } in
-            S.Loop resultType <$> mapM (synInstrToStruct ctx') body
-        synInstrToStruct ctx IfInstr {label, resultType, trueBranch, falseBranch} = do
+        synInstrToStruct ctx@FunCtx { ctxMod = Module { types } } BlockInstr {label, blockType, body} = do
             let ctx' = ctx { ctxLabels = label : ctxLabels ctx }
+            bt <- case blockType of
+                AnonimousTypeUse (FuncType [] []) -> return $ S.Inline Nothing
+                AnonimousTypeUse (FuncType [] [vt]) -> return $ S.Inline (Just vt)
+                typed -> case getTypeIndex types typed of
+                    Just idx -> return $ S.TypeIndex idx
+                    Nothing -> Left "unknown type"
+            S.Block bt <$> mapM (synInstrToStruct ctx') body
+        synInstrToStruct ctx@FunCtx { ctxMod = Module { types } } LoopInstr {label, blockType, body} = do
+            let ctx' = ctx { ctxLabels = label : ctxLabels ctx }
+            bt <- case blockType of
+                AnonimousTypeUse (FuncType [] []) -> return $ S.Inline Nothing
+                AnonimousTypeUse (FuncType [] [vt]) -> return $ S.Inline (Just vt)
+                typed -> case getTypeIndex types typed of
+                    Just idx -> return $ S.TypeIndex idx
+                    Nothing -> Left "unknown type"
+            S.Loop bt <$> mapM (synInstrToStruct ctx') body
+        synInstrToStruct ctx@FunCtx { ctxMod = Module { types } } IfInstr {label, blockType, trueBranch, falseBranch} = do
+            let ctx' = ctx { ctxLabels = label : ctxLabels ctx }
+            bt <- case blockType of
+                AnonimousTypeUse (FuncType [] []) -> return $ S.Inline Nothing
+                AnonimousTypeUse (FuncType [] [vt]) -> return $ S.Inline (Just vt)
+                typed -> case getTypeIndex types typed of
+                    Just idx -> return $ S.TypeIndex idx
+                    Nothing -> Left "unknown type"
             trueBranch' <- mapM (synInstrToStruct ctx') trueBranch
             falseBranch' <- mapM (synInstrToStruct ctx') falseBranch
-            return $ S.If resultType trueBranch' falseBranch'
+            return $ S.If bt trueBranch' falseBranch'
         
         synFunctionToStruct :: Module -> Function -> Either String S.Function
         synFunctionToStruct mod Function { funcType, locals, body } = do
@@ -1784,19 +1710,58 @@ desugarize fields = do
         isFuncImport Import { desc = ImportFunc _ _ } = True
         isFuncImport _ = False
 
+        checkFuncIdentsUniqueness :: Module -> Either String ()
+        checkFuncIdentsUniqueness m@Module { imports, functions } = do
+            mapM_ checkImportUniqueness $ filter isFuncImport imports
+            mapM_ checkFuncUniqueness functions
+            where
+                checkImportUniqueness Import { desc = ImportFunc (Just id) _ } =
+                    if length (getFuncIndexes m id) > 1
+                    then throwError "duplicate func"
+                    else return ()
+                checkImportUniqueness _ = return ()
+
+                checkFuncUniqueness Function { ident = Just id } =
+                    if length (getFuncIndexes m id) > 1
+                    then throwError "duplicate func"
+                    else return ()
+                checkFuncUniqueness _ = return ()
+
+        getFuncIndexes :: Module -> Ident -> [Natural]
+        getFuncIndexes Module { imports, functions } id =
+            let funcImports = zip [0..] $ filter isFuncImport imports in
+            let importIndexes = map fst $ filter (\(_, Import { desc = ImportFunc ident _ }) -> ident == Just id) funcImports in
+            let isIdent (_, Function { ident }) = ident == Just id in
+            let funcIndexes = map fst $ filter isIdent $ zip [length funcImports..] functions in
+            map fromIntegral $ importIndexes ++ funcIndexes
+
         getFuncIndex :: Module -> FuncIndex -> Maybe Natural
-        getFuncIndex Module { imports, functions } (Named id) =
-            let funImports = filter isFuncImport imports in
-            case findIndex (\(Import { desc = ImportFunc ident _ }) -> ident == Just id) funImports of
-                Just idx -> return $ fromIntegral idx
-                Nothing ->
-                    let isIdent (Function { ident }) = ident == Just id in
-                    fromIntegral . (+ length funImports) <$> findIndex isIdent functions
-        getFuncIndex Module { imports, functions } (Index idx) = Just idx
+        getFuncIndex mod (Named id) =
+            case getFuncIndexes mod id of
+                [idx] -> return idx
+                _ -> Nothing
+        getFuncIndex _ (Index idx) = Just idx
 
         -- tables
         synTableToStruct :: Table -> S.Table
         synTableToStruct (Table _ _ tableType) = S.Table tableType
+
+        checkTableIdentsUniqueness :: Module -> Either String ()
+        checkTableIdentsUniqueness m@Module { imports, tables } = do
+            mapM_ checkImportUniqueness $ filter isTableImport imports
+            mapM_ checkTableUniqueness tables
+            where
+                checkImportUniqueness Import { desc = ImportTable (Just id) _ } =
+                    if length (getTableIndexes m id) > 1
+                    then throwError "duplicate table"
+                    else return ()
+                checkImportUniqueness _ = return ()
+
+                checkTableUniqueness (Table _ (Just id) _) =
+                    if length (getTableIndexes m id) > 1
+                    then throwError "duplicate table"
+                    else return ()
+                checkTableUniqueness _ = return ()
 
         extractTable :: [Table] -> ModuleField -> [Table]
         extractTable tables (MFTable table) = table : tables
@@ -1806,19 +1771,41 @@ desugarize fields = do
         isTableImport Import { desc = ImportTable _ _ } = True
         isTableImport _ = False
 
+        getTableIndexes :: Module -> Ident -> [Natural]
+        getTableIndexes Module { imports, tables } id =
+            let tableImports = zip [0..] $ filter isTableImport imports in
+            let importIndexes = map fst $ filter (\(_, Import { desc = ImportTable ident _ }) -> ident == Just id) tableImports in
+            let isIdent (_, (Table _ ident _)) = ident == Just id in
+            let tableIndexes = map fst $ filter isIdent $ zip [length tableImports..] tables in
+            map fromIntegral $ importIndexes ++ tableIndexes
+
         getTableIndex :: Module -> TableIndex -> Maybe Natural
-        getTableIndex Module { imports, tables } (Named id) =
-            let tableImports = filter isTableImport imports in
-            case findIndex (\(Import { desc = ImportTable ident _ }) -> ident == Just id) tableImports of
-                Just idx -> return $ fromIntegral idx
-                Nothing ->
-                    let isIdent (Table _ (Just id) _) = True in
-                    fromIntegral . (+ length tableImports) <$> findIndex isIdent tables
-        getTableIndex Module { imports, tables } (Index idx) = Just idx
+        getTableIndex mod (Named id) =
+            case getTableIndexes mod id of
+                [idx] -> return idx
+                _ -> Nothing
+        getTableIndex _ (Index idx) = Just idx
 
         -- memory
         synMemoryToStruct :: Memory -> S.Memory
         synMemoryToStruct (Memory _ _ limits) = S.Memory limits
+
+        checkMemoryIdentsUniqueness :: Module -> Either String ()
+        checkMemoryIdentsUniqueness m@Module { imports, mems } = do
+            mapM_ checkImportUniqueness $ filter isMemImport imports
+            mapM_ checkMemUniqueness mems
+            where
+                checkImportUniqueness Import { desc = ImportMemory (Just id) _ } =
+                    if length (getMemIndexes m id) > 1
+                    then Left "duplicate memory"
+                    else return ()
+                checkImportUniqueness _ = return ()
+
+                checkMemUniqueness (Memory _ (Just id) _) =
+                    if length (getMemIndexes m id) > 1
+                    then Left "duplicate memory"
+                    else return ()
+                checkMemUniqueness _ = return ()
 
         extractMemory :: [Memory] -> ModuleField -> [Memory]
         extractMemory mems (MFMem mem) = mem : mems
@@ -1828,21 +1815,43 @@ desugarize fields = do
         isMemImport Import { desc = ImportMemory _ _ } = True
         isMemImport _ = False
 
+        getMemIndexes :: Module -> Ident -> [Natural]
+        getMemIndexes Module { imports, mems } id =
+            let memImports = zip [0..] $ filter isMemImport imports in
+            let importIndexes = map fst $ filter (\(_, Import { desc = ImportMemory ident _ }) -> ident == Just id) memImports in
+            let isIdent (_, (Memory _ ident _)) = ident == Just id in
+            let memIndexes = map fst $ filter isIdent $ zip [length memImports..] mems in
+            map fromIntegral $ importIndexes ++ memIndexes
+
         getMemIndex :: Module -> MemoryIndex -> Maybe Natural
-        getMemIndex Module { imports, mems } (Named id) =
-            let memImports = filter isMemImport imports in
-            case findIndex (\(Import { desc = ImportMemory ident _ }) -> ident == Just id) memImports of
-                Just idx -> return $ fromIntegral idx
-                Nothing ->
-                    let isIdent (Memory _ (Just id) _) = True in
-                    fromIntegral . (+ length memImports) <$> findIndex isIdent mems
-        getMemIndex Module { imports, mems } (Index idx) = Just idx
+        getMemIndex mod (Named id) =
+            case getMemIndexes mod id of
+                [idx] -> return idx
+                _ -> Nothing
+        getMemIndex _ (Index idx) = Just idx
 
         -- global
         synGlobalToStruct :: Module -> Global -> Either String S.Global
         synGlobalToStruct mod Global { globalType, initializer } =
             let ctx = FunCtx mod [] [] [] in
             S.Global globalType <$> mapM (synInstrToStruct ctx) initializer
+
+        checkGlobalIdentsUniqueness :: Module -> Either String ()
+        checkGlobalIdentsUniqueness m@Module { imports, globals } = do
+            mapM_ checkImportUniqueness $ filter isGlobalImport imports
+            mapM_ checkGlobalUniqueness globals
+            where
+                checkImportUniqueness Import { desc = ImportGlobal (Just id) _ } =
+                    if length (getGlobalIndexes m id) > 1
+                    then Left "duplicate global"
+                    else return ()
+                checkImportUniqueness _ = return ()
+
+                checkGlobalUniqueness (Global _ (Just id) _ _) =
+                    if length (getGlobalIndexes m id) > 1
+                    then Left "duplicate global"
+                    else return ()
+                checkGlobalUniqueness _ = return ()
 
         extractGlobal :: [Global] -> ModuleField -> [Global]
         extractGlobal globals (MFGlobal global) = global : globals
@@ -1852,14 +1861,19 @@ desugarize fields = do
         isGlobalImport Import { desc = ImportGlobal _ _ } = True
         isGlobalImport _ = False
 
+        getGlobalIndexes :: Module -> Ident -> [Natural]
+        getGlobalIndexes Module { imports, globals } id =
+            let globalImports = zip [0..] $ filter isGlobalImport imports in
+            let importIndexes = map fst $ filter (\(_, Import { desc = ImportGlobal ident _ }) -> ident == Just id) globalImports in
+            let isIdent (_, Global { ident }) = ident == Just id in
+            let globalIndexes = map fst $ filter isIdent $ zip [length globalImports..] globals in
+            map fromIntegral $ importIndexes ++ globalIndexes
+
         getGlobalIndex :: Module -> GlobalIndex -> Maybe Natural
-        getGlobalIndex Module { imports, globals } (Named id) =
-            let globalImports = filter isGlobalImport imports in
-            case findIndex (\(Import { desc = ImportGlobal ident _ }) -> ident == Just id) globalImports of
-                Just idx -> return $ fromIntegral idx
-                Nothing ->
-                    let isIdent (Global { ident }) = ident == Just id in
-                    fromIntegral . (+ length globalImports) <$> findIndex isIdent globals
+        getGlobalIndex mod@Module { imports, globals } (Named id) =
+            case getGlobalIndexes mod id of
+                [idx] -> return idx
+                _ -> Nothing
         getGlobalIndex Module { imports, globals } (Index idx) = Just idx
 
         -- elem segment
