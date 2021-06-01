@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Language.Wasm.Script (
     runScript,
+    runScript',
     OnAssertFail
 ) where
 
@@ -50,7 +51,10 @@ emptyState = ScriptState {
 type AssertM = State.StateT (ScriptState, String) IO
 
 runScript :: OnAssertFail -> Script -> IO ()
-runScript onAssertFail script = do
+runScript = runScript' Interpreter.invokeExport
+
+runScript' :: (Interpreter.Store -> Interpreter.ModuleInstance -> TL.Text -> [Interpreter.Value] -> IO (Maybe [Interpreter.Value])) -> OnAssertFail -> Script -> IO ()
+runScript' invokeExport onAssertFail script = do
     (globI32, globI64, globF32, globF64) <- hostGlobals
     (st, inst) <- Interpreter.makeHostModule Interpreter.emptyStore [
             ("print", hostPrint []),
@@ -127,7 +131,7 @@ runScript onAssertFail script = do
         runAction :: ScriptState -> Action -> IO (Maybe [Interpreter.Value])
         runAction st (Invoke ident name args) = do
             case getModule st ident of
-                Just m -> Interpreter.invokeExport (store st) m name $ map asArg args
+                Just m -> invokeExport (store st) m name $ map asArg args
                 Nothing -> error $ "Cannot invoke function on module with identifier '" ++ show ident  ++ "'. No such module"
         runAction st (Get ident name) = do
             case getModule st ident of
