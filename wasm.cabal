@@ -33,14 +33,14 @@ library
       Language.Wasm.Script
       Language.Wasm.Lexer
       Language.Wasm.Structure
+      Language.Wasm.Interpreter
+      Language.Wasm.Validate
       Language.Wasm
   other-modules:
       Language.Wasm.Binary
       Language.Wasm.Builder
       Language.Wasm.FloatUtils
-      Language.Wasm.Interpreter
       Language.Wasm.Parser
-      Language.Wasm.Validate
       Paths_wasm
   autogen-modules:
       Paths_wasm
